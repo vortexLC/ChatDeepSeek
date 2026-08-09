@@ -1,0 +1,23 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+dist-portable/
+src-tauri/target/
+
+# 运行时数据（含 API Key 等敏感信息，严禁提交）
+data/
+
+# 打包工具下载缓存
+scripts/nsis-3.11.zip
+scripts/nsis_tauri_utils.dll
+
+# 技能安装源（已全局安装至 ~/.config/opencode/skills）
+gitea-git-workflow/
+
+# 系统与编辑器文件
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
