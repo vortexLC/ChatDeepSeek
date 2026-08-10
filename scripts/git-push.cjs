@@ -20,7 +20,8 @@ if (!token) {
   process.exit(1);
 }
 const author = { name: "wlcgitea", email: "luolearninggorum@qq.com" };
-const auth = () => ({ username: "wlcgitea", password: token });
+// Gitea git HTTP 认证：token 作为 basic auth 用户名，密码留空
+const auth = () => ({ username: token, password: "" });
 
 (async () => {
   // 1. fetch 远程状态
@@ -53,17 +54,27 @@ const auth = () => ({ username: "wlcgitea", password: token });
   console.log("git add . ...");
   await git.add({ fs, dir, filepath: "." });
 
-  // 4. 提交
-  const message =
-    "feat: 异步视频任务状态追踪、对话区时间线/产物卡片、数据存储健壮性与多项修复\n\n" +
-    "- 视频任务：jobs 持久化、提交/完成/失败事件、任务卡片、Toast 通知、侧边栏徽标、重启恢复轮询\n" +
-    "- 产物卡片：图片缩略图、视频首帧截图、文件芯片；思考过程时间线化、任务完成横幅\n" +
-    "- 修复：停止生成保留已生成内容、流式滚动自由查看、代码块折叠卡片、上下文容量仅文本模型显示\n" +
-    "- 存储：session.json/settings 原子写入、保存失败错误提示、删除重试、存储闭环单元测试\n" +
-    "- 启动/打包脚本优化（中文界面、参数执行、WebView2 检测、保留便携版数据目录）";
-  console.log("commit ...");
-  const oid = await git.commit({ fs, dir, message, author });
-  console.log("committed:", oid.slice(0, 10));
+  // 4. 提交（无 staged 变更时跳过，避免产生空提交）
+  const status = await git.statusMatrix({ fs, dir });
+  const hasStaged = status.some(([, , , s]) => s === 2 || s === 3);
+  let oid = null;
+  if (hasStaged) {
+    const message =
+      "feat: 异步视频任务状态追踪、对话区时间线/产物卡片、数据存储健壮性与多项修复\n\n" +
+      "- 视频任务：jobs 持久化、提交/完成/失败事件、任务卡片、Toast 通知、侧边栏徽标、重启恢复轮询\n" +
+      "- 产物卡片：图片缩略图、视频首帧截图、文件芯片；思考过程时间线化、任务完成横幅\n" +
+      "- 修复：停止生成保留已生成内容、流式滚动自由查看、代码块折叠卡片、上下文容量仅文本模型显示\n" +
+      "- 存储：session.json/settings 原子写入、保存失败错误提示、删除重试、存储闭环单元测试\n" +
+      "- 启动/打包脚本优化（中文界面、参数执行、WebView2 检测、保留便携版数据目录）";
+    console.log("commit ...");
+    oid = await git.commit({ fs, dir, message, author });
+    console.log("committed:", oid.slice(0, 10));
+  } else {
+    console.log("no staged changes, skip commit");
+    try {
+      oid = await git.resolveRef({ fs, dir, ref: "HEAD" });
+    } catch {}
+  }
 
   // 5. 推送
   console.log("push origin main ...");
