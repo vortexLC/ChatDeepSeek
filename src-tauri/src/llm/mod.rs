@@ -1,20 +1,19 @@
 pub mod anthropic;
 pub mod search;
 
-pub use search::search_tool_json_anthropic;
-
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::Notify;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
+use crate::agent::tools;
 use crate::commands::{AppState, emit};
 use crate::models::*;
 
-pub const MAX_TOOL_ROUNDS: usize = 6;
+pub const MAX_TOOL_ROUNDS: usize = 8;
 
 #[derive(Clone)]
 pub struct CancelToken {
@@ -72,6 +71,7 @@ pub struct Accum {
     pub tool_calls: Vec<ToolCall>,
     pub tool_results: Vec<ToolResult>,
     pub search_items: Vec<SearchItem>,
+    pub artifacts: Vec<Artifact>,
 }
 
 impl Accum {
@@ -80,6 +80,7 @@ impl Accum {
             && self.content.is_empty()
             && self.search_items.is_empty()
             && self.tool_calls.is_empty()
+            && self.artifacts.is_empty()
     }
 }
 
@@ -138,7 +139,7 @@ pub async fn run_agent(
 ) {
     emit(&app, conv.id, "status", Some("thinking"));
     let mut acc = Accum::default();
-    let result = run_agent_inner(&app, &state, &conv, &settings, &token, &mut acc).await;
+    let result = run_agent_inner(&app, &state, &state, &conv, &settings, &token, &mut acc).await;
     match result {
         Ok(()) => {
             persist(&state, &conv, &acc);
@@ -165,6 +166,7 @@ fn persist(state: &AppState, conv: &Conversation, acc: &Accum) {
         &tool_calls_json,
         &tool_results_json,
         &acc.search_items,
+        &acc.artifacts,
     );
     state.db.touch(conv.id);
 }
@@ -172,21 +174,21 @@ fn persist(state: &AppState, conv: &Conversation, acc: &Accum) {
 async fn run_agent_inner(
     app: &AppHandle,
     state: &AppState,
+    state_arc: &Arc<AppState>,
     conv: &Conversation,
     settings: &AppSettings,
     token: &CancelToken,
     acc: &mut Accum,
 ) -> Result<(), String> {
-    let mut cur = build_outgoing(state, conv.id, conv.web_search);
+    let tools = tools::tools_for_mode(&conv.mode, conv.web_search);
+    let mut cur = build_outgoing(state, conv.id, !tools.is_empty());
 
     for _round in 0..MAX_TOOL_ROUNDS {
         if token.is_cancelled() {
             return Err("已停止生成".into());
         }
 
-        let analyzing = cur
-            .iter()
-            .any(|m| matches!(m, OutMsg::Tool { .. }));
+        let analyzing = cur.iter().any(|m| matches!(m, OutMsg::Tool { .. }));
         emit(
             app,
             conv.id,
@@ -194,12 +196,11 @@ async fn run_agent_inner(
             Some(if analyzing { "analyzing" } else { "thinking" }),
         );
 
-        let mut turn =
-            anthropic::run(app, state, conv, &settings.deepseek.api_key, &cur, token).await?;
+        let mut turn = anthropic::run(app, state, conv, &settings.deepseek.api_key, &cur, &tools, token).await?;
 
-        // 防御：联网搜索未开启时，忽略模型误发的工具调用（历史中可能残留工具痕迹）
+        // 防御：未提供联网搜索工具时，忽略模型误发的 web_search 调用
         if !conv.web_search {
-            turn.tool_calls.clear();
+            turn.tool_calls.retain(|tc| tc.name != tools::TOOL_WEB_SEARCH);
         }
 
         acc.reasoning.push_str(&turn.reasoning);
@@ -214,24 +215,15 @@ async fn run_agent_inner(
             if token.is_cancelled() {
                 return Err("已停止生成".into());
             }
-            let result = if tc.name == "web_search" {
-                let outcome = search::execute_search(
-                    app,
-                    state,
-                    conv.id,
-                    &tc.arguments,
-                    &settings.search,
-                    token,
-                )
-                .await?;
-                acc.search_items.extend(outcome.items.clone());
-                outcome.summary
-            } else {
-                format!("未知工具: {}", tc.name)
-            };
+            let outcome = tools::execute_tool(app, state_arc, conv.id, &tc.name, &tc.arguments, settings, token).await?;
+            // 产物实时推送到前端
+            for art in &outcome.artifacts {
+                emit_artifact(app, conv.id, art);
+            }
+            acc.artifacts.extend(outcome.artifacts.clone());
             let tr = ToolResult {
                 tool_call_id: tc.id.clone(),
-                content: result,
+                content: outcome.content,
             };
             // 工具调用与其结果成对保存，保证中断/出错时持久化的数据也能正确回放
             acc.tool_calls.push(tc.clone());
@@ -253,4 +245,13 @@ async fn run_agent_inner(
     }
 
     Ok(())
+}
+
+fn emit_artifact(app: &AppHandle, conv_id: i64, artifact: &Artifact) {
+    let payload = serde_json::json!({
+        "kind": "artifact",
+        "conversation_id": conv_id,
+        "item": artifact,
+    });
+    let _ = app.emit("chat_event", payload);
 }

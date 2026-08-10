@@ -3,6 +3,8 @@ export type Effort = "none" | "low" | "high" | "max";
 export type ThemeMode = "auto" | "light" | "dark";
 export type SearchStrategy = "auto" | "tavily" | "anysearch";
 
+export type AgentMode = "chat" | "image" | "video" | "build" | "agent";
+
 export interface Conversation {
   id: number;
   title: string;
@@ -11,6 +13,7 @@ export interface Conversation {
   web_search: boolean;
   deep_think: boolean;
   effort: Effort;
+  mode: AgentMode;
   created_at: number;
   updated_at: number;
 }
@@ -22,6 +25,14 @@ export interface SearchItem {
   provider: "tavily" | "anysearch";
 }
 
+export interface Artifact {
+  kind: "image" | "video" | "file";
+  name: string;
+  path: string;
+  size: number;
+  note: string;
+}
+
 export interface Message {
   id: number;
   conversation_id: number;
@@ -29,6 +40,7 @@ export interface Message {
   content: string;
   reasoning: string;
   search_results: SearchItem[];
+  artifacts: Artifact[];
   created_at: number;
 }
 
@@ -45,23 +57,45 @@ export interface SearchSettings {
   max_results: number;
 }
 
+export interface SiliconFlowGenSettings {
+  api_key: string;
+  base_url: string;
+  image_model: string;
+  video_model_i2v: string;
+  video_model_t2v: string;
+}
+
+export interface GenSettings {
+  provider: string;
+  siliconflow: SiliconFlowGenSettings;
+}
+
 export interface AppSettings {
   theme: ThemeMode;
   default_web_search: boolean;
   default_deep_think: boolean;
   default_effort: Effort;
   default_model: string;
+  default_mode: AgentMode;
   deepseek: DeepSeekSettings;
   search: SearchSettings;
+  gen: GenSettings;
 }
 
-export type ChatStatus = "idle" | "thinking" | "searching" | "analyzing" | "answering";
+export type ChatStatus =
+  | "idle"
+  | "thinking"
+  | "searching"
+  | "analyzing"
+  | "answering"
+  | "generating";
 
 export interface ChatDraft {
   status: ChatStatus;
   reasoning: string;
   content: string;
   searchItems: SearchItem[];
+  artifacts: Artifact[];
   searchProvider: string | null;
   error: string | null;
 }
@@ -72,13 +106,24 @@ export interface ChatEventPayload {
     | "reasoning_delta"
     | "content_delta"
     | "search_result"
+    | "artifact"
+    | "permission_request"
+    | "video_done"
     | "done"
     | "error";
   conversation_id: number;
   text?: string;
-  item?: SearchItem;
+  item?: SearchItem | Artifact;
   message?: string;
+  tool?: string;
+  path?: string;
   search_provider?: "tavily" | "anysearch" | null;
+}
+
+export interface PermissionRequest {
+  conversation_id: number;
+  tool: string;
+  path: string;
 }
 
 export interface ModelOption {
@@ -104,4 +149,11 @@ export interface WebPage {
 export interface EditTarget {
   id: number;
   text: string;
+}
+
+export interface PreviewContent {
+  kind: "web" | "file" | "image" | "video";
+  url: string;
+  title: string;
+  html: string;
 }

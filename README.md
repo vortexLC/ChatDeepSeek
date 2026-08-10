@@ -24,6 +24,20 @@
   - `data/db/` —— SQLite 数据库（会话上下文记忆）
   - `data/sessions/` —— 会话数据（每个会话一个 JSON 文件）
   - 开发模式下位于项目根目录；正式安装运行时若根目录不可写，自动回退至系统应用数据目录
+- **会话项目目录存储**：每个会话对应 `data/sessions/<会话ID>/` 项目目录，保存该会话全部数据：
+  - `session.json` —— 会话元数据（标题/模型/模式/开关）
+  - `messages.db` —— 会话内容（消息/思考链/工具调用/搜索结果/产物索引）
+  - `files/`、`images/`、`videos/` —— 文件、图片、视频产物
+- **五种模式**（发送框左上角模式菜单切换）：
+  - **Chat**：普通对话
+  - **Image**：Chat + 图片生成（硅基流动 Kolors 等）
+  - **Video**：Chat + 视频生成（硅基流动 Wan2.2-T2V/I2V-A14B，文生视频/图生视频）
+  - **Build**：编程工具（read_file/write_file/edit_file/delete_file/list_files/glob/grep + 隔离沙箱 bash），用于简单项目开发，无图片/视频生成
+  - **Agent**：全部工具（编程 + 图片 + 视频 + 联网搜索）
+- **操作系统级沙箱（Agent/Build 模式）**：bash 工具通过 **Windows AppContainer** 运行 —— 会话 `files/` 目录在系统层面（ACL）只授权该会话容器，子进程**无法访问工作区之外的任何文件**（无论命令怎么写，`C:\...`、messages.db 等一律被 OS 拒绝）；文件工具对目录外路径默认拒绝，需用户确认；沙箱初始化失败时拒绝执行（fail-closed）
+- **视频生成后台化**：Video 模式提交视频生成后立即返回，后台轮询（最长 10 分钟），完成自动保存并推送通知，**生成期间会话可继续正常对话**；删除/编辑会话时自动取消后台任务
+- **生成工具（Tool Calls）**：模型可通过 Function Calling 调用编程工具与生成工具；图片/视频生成结果自动保存到会话目录并实时推送到聊天界面，点击产物卡片可在右侧面板预览（图片查看 / 视频播放 / 文件内容 Diff）
+- **右侧面板**：显示链接网页内容、会话文件内容（Diff，随系统深浅色主题自适应）、图片预览与视频播放，右上角图标开关
 - **1M 上下文管理**：模型上下文总量 1M tokens，自动估算各会话用量：
   - 用量达 **90%** 时提示「建议开启新对话」
   - 用量**已满**时输入框禁用并提示「上下文已满，请新开会话」，发送消息会被拦截并提示
@@ -188,9 +202,20 @@ web_search(query, provider?, max_results?, search_depth?)
 ```
 data/
 ├── json/          # API Key、应用设置（settings.json）
-├── db/            # SQLite 数据库：会话上下文记忆（messages 表）
-└── sessions/      # 会话数据：每个会话一个 <会话ID>.json
+└── sessions/      # 会话数据：每个会话一个项目目录
+    └── <会话ID>/
+        ├── session.json   # 会话元数据
+        ├── messages.db    # 会话内容（消息/搜索数据/产物索引）
+        ├── files/         # 文件产物（Build/Agent 模式）
+        ├── images/        # 图片产物（Image/Agent 模式）
+        └── videos/        # 视频产物（Video/Agent 模式）
 ```
+
+## 图片与视频生成
+
+- 在设置面板「图像视频」中配置硅基流动（SiliconFlow）API Key 与模型（模块化设计，后续可扩展其它提供商）
+- **Image 模式**：模型通过 `generate_image` 工具调用 `images/generations` API 生成图片，自动下载保存到会话 `images/` 目录
+- **Video 模式**：模型通过 `generate_video` 工具提交 `video/submit` 并轮询状态，完成后下载保存到会话 `videos/` 目录（文生视频 Wan2.2-T2V-A14B / 图生视频 Wan2.2-I2V-A14B）
 
 ## 上下文管理（1M）
 

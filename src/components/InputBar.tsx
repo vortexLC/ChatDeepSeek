@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import type { EditTarget, Effort, ModelOption } from "../types";
+import type { AgentMode, EditTarget, Effort, ModelOption } from "../types";
 import {
   BrainIcon,
   ChevronDownIcon,
+  ChevronUpIcon,
   GlobeIcon,
   GlobeOffIcon,
   PencilIcon,
@@ -17,12 +18,26 @@ const EFFORT_LABELS: Record<string, string> = {
   max: "最大",
 };
 
+const MODE_OPTIONS: { value: AgentMode; label: string; title: string }[] = [
+  { value: "chat", label: "Chat", title: "普通对话" },
+  { value: "image", label: "Image", title: "Chat + 图片生成" },
+  { value: "video", label: "Video", title: "Chat + 视频生成" },
+  { value: "build", label: "Build", title: "编程工具（隔离沙箱）" },
+  { value: "agent", label: "Agent", title: "全部工具（编程 + 图片 + 视频）" },
+];
+
+function modeLabel(mode: AgentMode): string {
+  return MODE_OPTIONS.find((m) => m.value === mode)?.label ?? "Chat";
+}
+
 interface InputBarProps {
   disabled: boolean;
   contextFull: boolean;
   streaming: boolean;
   editTarget: EditTarget | null;
   onCancelEdit: () => void;
+  mode: AgentMode;
+  onSetMode: (mode: AgentMode) => void;
   modelOptions: ModelOption[];
   currentModel: string;
   onSelectModel: (option: ModelOption) => void;
@@ -44,6 +59,8 @@ export function InputBar({
   streaming,
   editTarget,
   onCancelEdit,
+  mode,
+  onSetMode,
   modelOptions,
   currentModel,
   onSelectModel,
@@ -59,6 +76,7 @@ export function InputBar({
   onStop,
 }: InputBarProps) {
   const [value, setValue] = useState("");
+  const [modeOpen, setModeOpen] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -141,6 +159,40 @@ export function InputBar({
         />
         <div className="input-tools">
           <div className="input-tools-left">
+            <div className="mode-select-wrap">
+              <button
+                className="mode-trigger"
+                title="选择模式"
+                onClick={() => setModeOpen((v) => !v)}
+                disabled={inputDisabled || streaming}
+              >
+                {modeLabel(mode)}
+                <ChevronUpIcon size={12} />
+              </button>
+              {modeOpen && (
+                <>
+                  <div
+                    className="mode-popover-mask"
+                    onClick={() => setModeOpen(false)}
+                  />
+                  <div className="mode-popover">
+                    {MODE_OPTIONS.map((m) => (
+                      <button
+                        key={m.value}
+                        className={`mode-option${mode === m.value ? " active" : ""}`}
+                        onClick={() => {
+                          onSetMode(m.value);
+                          setModeOpen(false);
+                        }}
+                      >
+                        <span className="mode-option-label">{m.label}</span>
+                        <span className="mode-option-desc">{m.title}</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
             <div className="tool-model-select">
               <select
                 value={currentModel}

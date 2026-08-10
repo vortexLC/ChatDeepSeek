@@ -1,9 +1,9 @@
-import type { WebPage } from "../types";
+import type { PreviewContent } from "../types";
 import { ExternalIcon, LinkIcon, XIcon } from "./icons";
 
 interface WebPreviewPanelProps {
   open: boolean;
-  preview: WebPage | null;
+  preview: PreviewContent | null;
   loading: boolean;
   error: string | null;
   onClose: () => void;
@@ -23,12 +23,12 @@ export function WebPreviewPanel({
     <aside className="web-panel">
       <div className="web-panel-header">
         <div className="web-panel-title-wrap">
-          <div className="web-panel-title" title={preview?.title ?? "网页预览"}>
-            {preview?.title || "网页预览"}
+          <div className="web-panel-title" title={preview?.title ?? "预览"}>
+            {preview?.title || "预览"}
           </div>
           {preview && <div className="web-panel-url">{preview.url}</div>}
         </div>
-        {preview && (
+        {preview && preview.kind === "web" && (
           <button
             className="web-panel-icon-btn"
             onClick={() => onOpenExternal(preview.url)}
@@ -49,21 +49,31 @@ export function WebPreviewPanel({
         {loading && (
           <div className="web-panel-loading">
             <LinkIcon size={14} />
-            正在加载网页内容…
+            正在加载内容…
           </div>
         )}
         {error && <div className="web-panel-error">{error}</div>}
-        {!loading && !error && preview && preview.html && (
+        {!loading && !error && preview && preview.kind === "image" && (
+          <div className="web-panel-media">
+            <img src={preview.url} alt={preview.title} />
+          </div>
+        )}
+        {!loading && !error && preview && preview.kind === "video" && (
+          <div className="web-panel-media">
+            <video src={preview.url} controls autoPlay />
+          </div>
+        )}
+        {!loading && !error && preview && (preview.kind === "web" || preview.kind === "file") && (
           <iframe
             className="web-panel-frame"
             sandbox=""
             srcDoc={preview.html}
-            title={preview.url}
+            title={preview.title}
           />
         )}
         {!loading && !error && !preview && (
           <div className="web-panel-empty">
-            点击搜索结果或回答中的来源链接，即可在右侧预览网页内容
+            点击链接、文件或产物卡片，即可在右侧预览内容
           </div>
         )}
       </div>

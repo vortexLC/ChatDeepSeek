@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  AgentMode,
   AppSettings,
   ChatEventPayload,
   ContextStatus,
@@ -18,6 +19,7 @@ export interface ConversationUpdate {
   web_search?: boolean;
   deep_think?: boolean;
   effort?: Effort;
+  mode?: AgentMode;
 }
 
 export async function getInitialState(): Promise<{
@@ -83,6 +85,27 @@ export async function editAndResend(
 
 export async function fetchWebPage(url: string): Promise<WebPage> {
   return invoke("fetch_webpage", { url });
+}
+
+export async function fetchFileContent(
+  conversationId: number,
+  path: string
+): Promise<WebPage> {
+  return invoke("fetch_file_content", { conversationId, path });
+}
+
+export async function getArtifactAbsPath(
+  conversationId: number,
+  path: string
+): Promise<string> {
+  return invoke("get_artifact_abs_path", { conversationId, path });
+}
+
+export async function respondPermission(
+  conversationId: number,
+  approve: boolean
+): Promise<void> {
+  return invoke("respond_permission", { conversationId, approve });
 }
 
 export async function stopGeneration(conversationId: number): Promise<void> {

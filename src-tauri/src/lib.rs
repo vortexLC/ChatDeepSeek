@@ -1,3 +1,4 @@
+mod agent;
 mod commands;
 mod db;
 mod llm;
@@ -9,7 +10,8 @@ use std::sync::Arc;
 use crate::{commands::AppState, db::Db};
 use tauri::Manager;
 
-/// 向上查找项目根目录（含 package.json + src-tauri 标记），仅开发模式命中
+/// 向上查找项目根目录（含 package.json + src-tauri 标记），仅开发模式使用
+#[cfg(debug_assertions)]
 fn resolve_project_root() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir = Some(cwd.as_path());
@@ -74,6 +76,9 @@ pub fn run() {
             commands::stop_generation,
             commands::test_deepseek_connection,
             commands::fetch_webpage,
+            commands::fetch_file_content,
+            commands::get_artifact_abs_path,
+            commands::respond_permission,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

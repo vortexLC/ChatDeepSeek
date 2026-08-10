@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use tauri::AppHandle;
 
 use crate::commands::{AppState, DEEPSEEK_ANTHROPIC_BASE, emit};
-use crate::llm::{CancelToken, OutMsg, TurnResult, search_tool_json_anthropic};
+use crate::llm::{CancelToken, OutMsg, TurnResult};
 use crate::models::*;
 
 const MAX_TOKENS: u32 = 16384;
@@ -15,16 +15,17 @@ pub async fn run(
     conv: &Conversation,
     api_key: &str,
     msgs: &[OutMsg],
+    tools: &[serde_json::Value],
     token: &CancelToken,
 ) -> Result<TurnResult, String> {
     let url = format!("{DEEPSEEK_ANTHROPIC_BASE}/v1/messages");
 
-    let body = build_body(conv, msgs, true);
+    let body = build_body(conv, msgs, tools, true);
     let mut resp = send_request(state, &url, api_key, &body).await?;
 
     if resp.status() == 400 {
         // 极少数兼容服务不接受思考模式参数，收到 400 时去掉思考参数重试一次
-        let body2 = build_body(conv, msgs, false);
+        let body2 = build_body(conv, msgs, tools, false);
         resp = send_request(state, &url, api_key, &body2).await?;
     }
 
@@ -156,7 +157,12 @@ pub async fn run(
     })
 }
 
-fn build_body(conv: &Conversation, msgs: &[OutMsg], thinking: bool) -> serde_json::Value {
+fn build_body(
+    conv: &Conversation,
+    msgs: &[OutMsg],
+    tools: &[serde_json::Value],
+    thinking: bool,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": conv.model,
         "max_tokens": MAX_TOKENS,
@@ -176,8 +182,8 @@ fn build_body(conv: &Conversation, msgs: &[OutMsg], thinking: bool) -> serde_jso
             body["thinking"] = serde_json::json!({"type": "disabled"});
         }
     }
-    if conv.web_search {
-        body["tools"] = serde_json::json!([search_tool_json_anthropic()]);
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools.to_vec());
         body["tool_choice"] = serde_json::json!({"type": "auto"});
     }
     body
@@ -221,7 +227,14 @@ fn today_cn() -> String {
 
 fn build_system_prompt(conv: &Conversation) -> String {
     let date = today_cn();
-    if conv.web_search {
+    let mode_hint = match conv.mode.as_str() {
+        crate::models::MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件。",
+        crate::models::MODE_AGENT => "\n\n【当前模式：Agent】你可以使用全部工具：编程工具用于项目开发，generate_image 用于生成图片，generate_video 用于生成视频（耗时约几分钟，完成后会告知保存路径）。",
+        crate::models::MODE_IMAGE => "\n\n【当前模式：Image】如果用户要求生成、绘制图片，请调用 generate_image 工具（生成结果会自动保存）。",
+        crate::models::MODE_VIDEO => "\n\n【当前模式：Video】如果用户要求生成视频，请调用 generate_video 工具（文生视频无需图片；图生视频需传图片 URL。生成需几分钟，请告知用户耐心等待）。",
+        _ => "",
+    };
+    let base = if conv.web_search {
         format!(
             "你是 ChatDeepSeek 智能助手，基于 DeepSeek 大模型构建。今天是 {date}。\n\
 \n\
@@ -249,7 +262,8 @@ fn build_system_prompt(conv: &Conversation) -> String {
 - 绝对不要说自己「正在搜索」「为你搜索」「稍后查询」「等我查一下」等话术，也不要声称自己具备联网能力；\n\
 - 如果用户询问实时新闻、最新事件、实时行情、今日热点等需要联网才能获取的信息，请如实告知：「当前未开启联网搜索，我无法获取实时信息」，然后基于自身已有知识给出一般性说明、背景分析或建议，并提醒用户可开启消息框中的「联网搜索」后再询问。"
         )
-    }
+    };
+    format!("{base}{mode_hint}")
 }
 
 fn build_messages_json(msgs: &[OutMsg]) -> Vec<serde_json::Value> {

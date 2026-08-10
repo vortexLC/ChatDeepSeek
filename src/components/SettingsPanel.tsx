@@ -7,6 +7,7 @@ const TABS = [
   { id: "general", label: "通用" },
   { id: "models", label: "AI 模型" },
   { id: "search", label: "搜索服务" },
+  { id: "gen", label: "图像视频" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -80,6 +81,15 @@ export function SettingsPanel({
     setDraft((d) => ({ ...d, [key]: value }));
   const setDeepSeek = (key: keyof AppSettings["deepseek"], value: string) =>
     setDraft((d) => ({ ...d, deepseek: { ...d.deepseek, [key]: value } }));
+  const setGen = <K extends keyof AppSettings["gen"]>(
+    key: K,
+    value: AppSettings["gen"][K]
+  ) => setDraft((d) => ({ ...d, gen: { ...d.gen, [key]: value } }));
+  const setSF = (key: keyof AppSettings["gen"]["siliconflow"], value: string) =>
+    setDraft((d) => ({
+      ...d,
+      gen: { ...d.gen, siliconflow: { ...d.gen.siliconflow, [key]: value } },
+    }));
   const setSearch = <K extends keyof AppSettings["search"]>(
     key: K,
     value: AppSettings["search"][K]
@@ -163,6 +173,20 @@ export function SettingsPanel({
                   <option value="low">低</option>
                   <option value="high">高</option>
                   <option value="max">最大</option>
+                </select>
+              </Field>
+              <Field label="默认模式" hint="新对话默认使用的模式，发送框左侧可随时切换">
+                <select
+                  value={draft.default_mode}
+                  onChange={(e) =>
+                    set("default_mode", e.target.value as AppSettings["default_mode"])
+                  }
+                >
+                  <option value="chat">Chat（普通对话）</option>
+                  <option value="image">Image（+ 图片生成）</option>
+                  <option value="video">Video（+ 视频生成）</option>
+                  <option value="build">Build（编程工具）</option>
+                  <option value="agent">Agent（全部工具）</option>
                 </select>
               </Field>
 
@@ -313,6 +337,72 @@ export function SettingsPanel({
                     )
                   }
                 />
+              </Field>
+            </>
+          )}
+
+          {tab === "gen" && (
+            <>
+              <div className="settings-section-title">生成服务提供商</div>
+              <Field label="提供商" hint="当前适配硅基流动，模块化设计支持后续扩展其它提供商">
+                <select
+                  value={draft.gen.provider}
+                  onChange={(e) => setGen("provider", e.target.value)}
+                >
+                  <option value="siliconflow">硅基流动 SiliconFlow</option>
+                </select>
+              </Field>
+
+              <div className="settings-section-title">硅基流动（图片 / 视频生成）</div>
+              <Field
+                label="API Key"
+                hint="从 cloud.siliconflow.cn 获取。用于 Image（图片生成）与 Video（视频生成）模式。"
+              >
+                <input
+                  type="password"
+                  value={draft.gen.siliconflow.api_key}
+                  placeholder="sk-..."
+                  onChange={(e) => setSF("api_key", e.target.value)}
+                />
+              </Field>
+              <Field label="API Base URL">
+                <input
+                  type="text"
+                  value={draft.gen.siliconflow.base_url}
+                  onChange={(e) => setSF("base_url", e.target.value)}
+                />
+              </Field>
+              <Field label="图片生成模型" hint="推荐 Kwai-Kolors/Kolors">
+                <input
+                  type="text"
+                  value={draft.gen.siliconflow.image_model}
+                  onChange={(e) => setSF("image_model", e.target.value)}
+                />
+              </Field>
+              <div className="field-row">
+                <Field label="视频生成模型（文生视频）" hint="Wan2.2-T2V-A14B">
+                  <input
+                    type="text"
+                    value={draft.gen.siliconflow.video_model_t2v}
+                    onChange={(e) => setSF("video_model_t2v", e.target.value)}
+                  />
+                </Field>
+                <Field label="视频生成模型（图生视频）" hint="Wan2.2-I2V-A14B">
+                  <input
+                    type="text"
+                    value={draft.gen.siliconflow.video_model_i2v}
+                    onChange={(e) => setSF("video_model_i2v", e.target.value)}
+                  />
+                </Field>
+              </div>
+              <Field label="模式说明" hint="Image 模式 = Chat + 图片生成；Video 模式 = Chat + 视频生成；Build = 编程工具（沙箱）；Agent = 全部工具">
+                <div className="field-static">
+                  <span className="chip">Chat</span>
+                  <span className="chip">Image</span>
+                  <span className="chip">Video</span>
+                  <span className="chip">Build</span>
+                  <span className="chip">Agent</span>
+                </div>
               </Field>
             </>
           )}

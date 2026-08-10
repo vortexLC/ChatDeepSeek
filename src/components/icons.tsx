@@ -97,6 +97,14 @@ export function ChevronDownIcon({ size = 14, className }: IconProps) {
   );
 }
 
+export function ChevronUpIcon({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="m18 15-6-6-6 6" />
+    </svg>
+  );
+}
+
 export function ChatIcon({ size = 18, className }: IconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
@@ -143,6 +151,25 @@ export function PencilIcon({ size = 13, className }: IconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
       <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+    </svg>
+  );
+}
+
+export function ImageIcon({ size = 15, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <circle cx="8.5" cy="8.5" r="1.5" />
+      <path d="m21 15-5-5L5 21" />
+    </svg>
+  );
+}
+
+export function VideoIcon({ size = 15, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <rect x="2" y="4" width="16" height="16" rx="2" />
+      <path d="m22 8-6 4 6 4V8z" />
     </svg>
   );
 }

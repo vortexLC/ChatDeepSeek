@@ -1,5 +1,7 @@
 import { useDeferredValue, useEffect, useRef, useState } from "react";
 import type {
+  AgentMode,
+  Artifact,
   ChatDraft,
   ContextStatus,
   Conversation,
@@ -16,9 +18,11 @@ import {
   AlertIcon,
   ChevronDownIcon,
   GlobeIcon,
+  ImageIcon,
   LinkIcon,
   SearchIcon,
   SparkIcon,
+  VideoIcon,
   XIcon,
 } from "./icons";
 
@@ -41,12 +45,65 @@ function effortOptionsForFamily(family: string): Effort[] {
   return ["low", "high", "max"];
 }
 
+function ArtifactCards({
+  artifacts,
+  onOpenArtifact,
+  onOpenFile,
+  convId,
+}: {
+  artifacts: Artifact[];
+  onOpenArtifact: (convId: number, artifact: Artifact) => void;
+  onOpenFile: (convId: number, path: string, title: string) => void;
+  convId: number;
+}) {
+  if (!artifacts || artifacts.length === 0) return null;
+  return (
+    <div className="artifact-list">
+      {artifacts.map((a, i) => (
+        <button
+          key={`${a.path}-${i}`}
+          className={`artifact-card ${a.kind}`}
+          onClick={() =>
+            a.kind === "file"
+              ? onOpenFile(convId, a.path, a.name)
+              : onOpenArtifact(convId, a)
+          }
+          title={a.path}
+        >
+          {a.kind === "image" ? (
+            <ImageIcon size={15} />
+          ) : a.kind === "video" ? (
+            <VideoIcon size={15} />
+          ) : (
+            <LinkIcon size={13} />
+          )}
+          <span className="artifact-name">{a.name}</span>
+          <span className="artifact-note">
+            {a.kind === "image"
+              ? "图片"
+              : a.kind === "video"
+                ? "视频"
+                : "文件"}
+            {a.size > 0 ? ` · ${(a.size / 1024).toFixed(0)} KB` : ""}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function DraftMessage({
   draft,
   onOpenLink,
+  onOpenArtifact,
+  onOpenFile,
+  convId,
 }: {
   draft: ChatDraft;
   onOpenLink: (url: string) => void;
+  onOpenArtifact: (convId: number, artifact: Artifact) => void;
+  onOpenFile: (convId: number, path: string, title: string) => void;
+  convId: number;
 }) {
   const [showReasoning, setShowReasoning] = useState(false);
   // 流式渲染节流：高优先级渲染走低优先级延迟值，避免每次 token 全量重渲染长 Markdown
@@ -83,6 +140,11 @@ function DraftMessage({
               : "搜索结果"}
             ，提炼与问题相关的核心事实…
           </span>
+        ) : draft.status === "generating" ? (
+          <span className="status-chip generating">
+            <SparkIcon size={12} />
+            正在生成（图片/视频生成可能需要几分钟）…
+          </span>
         ) : (
           <span className="status-chip answering">
             <SparkIcon size={12} />
@@ -95,6 +157,12 @@ function DraftMessage({
       <div className="msg-avatar">DS</div>
       <div className="msg-body">
         {statusChip}
+        <ArtifactCards
+          artifacts={draft.artifacts}
+          onOpenArtifact={onOpenArtifact}
+          onOpenFile={onOpenFile}
+          convId={convId}
+        />
         {draft.searchItems.length > 0 && (
           <div className="search-cards">
             <div className="search-cards-label">
@@ -155,12 +223,15 @@ interface ChatViewProps {
   onToggleWebSearch: () => void;
   onToggleDeepThink: () => void;
   onSetEffort: (e: Effort) => void;
+  onSetMode: (mode: AgentMode) => void;
   editTarget: EditTarget | null;
   onCancelEdit: () => void;
   onSend: (content: string) => void;
   onSendEdit: (content: string) => void;
   onStop: () => void;
   onOpenLink: (url: string) => void;
+  onOpenFile: (convId: number, path: string, title: string) => void;
+  onOpenArtifact: (convId: number, artifact: Artifact) => void;
   onEditMessage: (message: Message) => void;
 }
 
@@ -178,12 +249,15 @@ export function ChatView({
   onToggleWebSearch,
   onToggleDeepThink,
   onSetEffort,
+  onSetMode,
   editTarget,
   onCancelEdit,
   onSend,
   onSendEdit,
   onStop,
   onOpenLink,
+  onOpenFile,
+  onOpenArtifact,
   onEditMessage,
 }: ChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -196,7 +270,14 @@ export function ChatView({
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, draft?.reasoning, draft?.content, draft?.status, draft?.searchItems]);
+  }, [
+    messages,
+    draft?.reasoning,
+    draft?.content,
+    draft?.status,
+    draft?.searchItems,
+    draft?.artifacts,
+  ]);
 
   if (!conversation) {
     return (
@@ -266,11 +347,19 @@ export function ChatView({
             key={m.id}
             message={m}
             onOpenLink={onOpenLink}
+            onOpenFile={onOpenFile}
+            onOpenArtifact={onOpenArtifact}
             onEditMessage={onEditMessage}
           />
         ))}
         {draft && (
-          <DraftMessage draft={draft} onOpenLink={onOpenLink} />
+          <DraftMessage
+            draft={draft}
+            onOpenLink={onOpenLink}
+            onOpenArtifact={onOpenArtifact}
+            onOpenFile={onOpenFile}
+            convId={conversation.id}
+          />
         )}
         <div ref={endRef} />
       </div>
@@ -302,6 +391,8 @@ export function ChatView({
         streaming={streaming}
         editTarget={editTarget}
         onCancelEdit={onCancelEdit}
+        mode={conversation.mode}
+        onSetMode={onSetMode}
         modelOptions={modelOptions}
         currentModel={conversation.model}
         onSelectModel={onSelectModel}

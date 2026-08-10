@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use reqwest::Client;
 use tauri::{AppHandle, Emitter, State};
+use tokio::sync::oneshot;
 
 use crate::db::Db;
 use crate::llm::{CancelToken, run_agent};
@@ -14,6 +15,10 @@ const MAX_WEBPAGE_BYTES: usize = 8 * 1024 * 1024;
 pub struct AppState {
     pub db: Db,
     pub cancels: Mutex<HashMap<i64, Arc<CancelToken>>>,
+    /// 越界访问待用户确认：conv_id -> 应答通道
+    pub pending_perms: Mutex<HashMap<i64, oneshot::Sender<bool>>>,
+    /// 后台任务（如视频生成轮询）：key -> 取消令牌
+    pub bg_tasks: Mutex<HashMap<String, Arc<CancelToken>>>,
     pub client: Client,
 }
 
@@ -26,8 +31,55 @@ impl AppState {
         Ok(Self {
             db,
             cancels: Mutex::new(HashMap::new()),
+            pending_perms: Mutex::new(HashMap::new()),
+            bg_tasks: Mutex::new(HashMap::new()),
             client,
         })
+    }
+}
+
+/// 取消某会话的所有后台任务（删除/编辑会话时调用）
+pub fn cancel_session_tasks(state: &AppState, conv_id: i64) {
+    let prefix = format!("video-{conv_id}");
+    let mut tasks = state.bg_tasks.lock().unwrap();
+    let keys: Vec<String> = tasks
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for k in keys {
+        if let Some(t) = tasks.remove(&k) {
+            t.cancel();
+        }
+    }
+}
+
+/// 请求用户确认越界访问（会话目录之外的文件操作），90 秒超时自动拒绝
+pub async fn request_permission(
+    app: &AppHandle,
+    state: &AppState,
+    conversation_id: i64,
+    tool: &str,
+    path: &str,
+) -> Result<bool, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .pending_perms
+        .lock()
+        .unwrap()
+        .insert(conversation_id, tx);
+    let payload = serde_json::json!({
+        "kind": "permission_request",
+        "conversation_id": conversation_id,
+        "tool": tool,
+        "path": path,
+    });
+    let _ = app.emit("chat_event", payload);
+    match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
+        Ok(Ok(true)) => Ok(true),
+        Ok(Ok(false)) => Err(format!("用户拒绝了该操作：{tool} {path}")),
+        Ok(Err(_)) => Err("权限确认已失效".into()),
+        Err(_) => Err("等待用户确认超时，已拒绝该操作".into()),
     }
 }
 
@@ -67,11 +119,13 @@ pub fn update_conversation(
 
 #[tauri::command]
 pub fn delete_conversation(state: State<Arc<AppState>>, id: i64) -> Result<(), String> {
+    cancel_session_tasks(&state, id);
     state.db.delete_conversation(id)
 }
 
 #[tauri::command]
 pub fn clear_all_conversations(state: State<Arc<AppState>>) -> Result<(), String> {
+    state.bg_tasks.lock().unwrap().clear();
     state.db.clear_all()
 }
 
@@ -135,7 +189,7 @@ pub async fn send_message(
 
     state
         .db
-        .insert_message(conversation_id, "user", trimmed, "", "[]", "[]", &[])
+        .insert_message(conversation_id, "user", trimmed, "", "[]", "[]", &[], &[])
         .map_err(|e| e.to_string())?;
     state.db.set_title_if_default(conversation_id, trimmed);
     state.db.touch(conversation_id);
@@ -174,6 +228,7 @@ pub async fn edit_and_resend(
     }
 
     state.db.delete_messages_from(conversation_id, message_id)?;
+    cancel_session_tasks(&state, conversation_id);
 
     let usage = state.db.context_usage(conversation_id);
     if usage.full {
@@ -182,7 +237,7 @@ pub async fn edit_and_resend(
 
     state
         .db
-        .insert_message(conversation_id, "user", trimmed, "", "[]", "[]", &[])
+        .insert_message(conversation_id, "user", trimmed, "", "[]", "[]", &[], &[])
         .map_err(|e| e.to_string())?;
     state.db.touch(conversation_id);
 
@@ -254,6 +309,53 @@ pub async fn test_deepseek_connection(
     }
 }
 
+/// 判断目标 URL 是否指向内网/本地/回环地址（SSRF 防护）
+fn is_ssrf_target(url: &str) -> bool {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return true,
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h,
+        None => return true,
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        ips.push(ip);
+    } else if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0)) {
+        for a in addrs {
+            ips.push(a.ip());
+        }
+    }
+    if ips.is_empty() {
+        // 域名无法解析，视为不可信目标
+        return true;
+    }
+    ips.into_iter().any(|ip| match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 10
+                || o[0] == 127
+                || o[0] == 0
+                || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || o[0] >= 224
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00 == 0xfc00)
+                || v6.segments()[0] == 0xfe80
+        }
+    })
+}
+
 /// 抓取网页，返回可安全渲染的页面 HTML（保留结构/样式/图片，剔除脚本等危险内容），供右侧预览面板展示
 #[tauri::command]
 pub async fn fetch_webpage(
@@ -262,6 +364,9 @@ pub async fn fetch_webpage(
 ) -> Result<WebPage, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return err("仅支持 http/https 链接");
+    }
+    if is_ssrf_target(&url) {
+        return err("出于安全考虑，仅允许访问公网地址");
     }
     let resp = state
         .client
@@ -357,10 +462,16 @@ fn sanitize_html(el: &scraper::ElementRef, buf: &mut String) {
     buf.push_str(name);
     for (attr, val) in el.value().attrs() {
         if matches!(attr, "href" | "src" | "alt" | "title" | "width" | "height") {
+            // 过滤 javascript: / data:text/html / vbscript: 等危险协议，防止 XSS
+            let safe = if matches!(attr, "href" | "src") {
+                sanitize_protocol(val)
+            } else {
+                val.to_string()
+            };
             buf.push(' ');
             buf.push_str(attr);
             buf.push_str("=\"");
-            buf.push_str(&escape_attr(val));
+            buf.push_str(&escape_attr(&safe));
             buf.push('"');
         }
     }
@@ -395,6 +506,24 @@ fn escape_attr(s: &str) -> String {
     escape_text(s).replace('"', "&quot;")
 }
 
+/// 过滤 URL 属性中的危险协议，若协议不在 https/http/相对/data图片 白名单内则置空
+fn sanitize_protocol(v: &str) -> String {
+    let t = v.trim();
+    let lower = t.to_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("//")
+        || lower.starts_with('/')
+        || lower.starts_with('#')
+        || lower.starts_with("data:image/")
+        || t.is_empty()
+    {
+        t.to_string()
+    } else {
+        String::new()
+    }
+}
+
 pub fn emit(app: &AppHandle, conversation_id: i64, kind: &str, text: Option<&str>) {
     let mut payload = serde_json::json!({
         "kind": kind,
@@ -404,4 +533,79 @@ pub fn emit(app: &AppHandle, conversation_id: i64, kind: &str, text: Option<&str
         payload["text"] = serde_json::Value::String(t.to_string());
     }
     let _ = app.emit("chat_event", payload);
+}
+
+/// 读取会话目录内的文件内容（文本），供右侧面板文件预览/Diff 使用
+#[tauri::command]
+pub async fn fetch_file_content(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: i64,
+    path: String,
+) -> Result<crate::models::WebPage, String> {
+    let p = state
+        .db
+        .session_abs_path(conversation_id, &path)
+        .ok_or_else(|| "路径越界：只能访问本会话目录内的文件".to_string())?;
+    if !p.is_file() {
+        return Err(format!("文件不存在: {path}"));
+    }
+    let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+    if size > 2 * 1024 * 1024 {
+        return Err("文件过大（超过 2MB），无法预览".into());
+    }
+    let content = std::fs::read_to_string(&p).map_err(|e| format!("读取文件失败: {e}"))?;
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    let escaped = escape_html(&content);
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>body{{font-family:Consolas,monospace;font-size:13px;line-height:1.6;margin:0;padding:14px;background:#fafafa;color:#1c2027;white-space:pre-wrap;word-break:break-word}}a{{color:#4d6bfe}}@media (prefers-color-scheme: dark){{body{{background:#16181d;color:#e2e4e9}}a{{color:#7db1ff}}}}</style></head><body>{escaped}</body></html>"
+    );
+    Ok(crate::models::WebPage {
+        url: format!("file:///{}", p.display()),
+        title: format!("{name}（{size} 字节）"),
+        html,
+    })
+}
+
+/// 返回会话产物的本地绝对路径（前端通过 asset 协议展示图片/视频）
+#[tauri::command]
+pub fn get_artifact_abs_path(
+    state: State<Arc<AppState>>,
+    conversation_id: i64,
+    path: String,
+) -> Result<String, String> {
+    let p = state
+        .db
+        .session_abs_path(conversation_id, &path)
+        .ok_or_else(|| "路径越界".to_string())?;
+    if !p.exists() {
+        return Err(format!("文件不存在: {path}"));
+    }
+    Ok(p.to_string_lossy().to_string())
+}
+
+/// 用户对越界访问确认请求的应答
+#[tauri::command]
+pub fn respond_permission(
+    state: State<Arc<AppState>>,
+    conversation_id: i64,
+    approve: bool,
+) -> Result<(), String> {
+    if let Some(tx) = state
+        .pending_perms
+        .lock()
+        .unwrap()
+        .remove(&conversation_id)
+    {
+        let _ = tx.send(approve);
+    }
+    Ok(())
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

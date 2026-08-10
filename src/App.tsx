@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   clearAllConversations,
   createConversation,
   deleteConversation,
   editAndResend,
+  fetchFileContent,
   fetchWebPage,
+  getArtifactAbsPath,
   getContextStatus,
   getInitialState,
   getMessages,
   onChatEvent,
+  respondPermission,
   saveSettings,
   sendMessage,
   stopGeneration,
@@ -17,7 +21,9 @@ import {
 } from "./api";
 import type { ConversationUpdate } from "./api";
 import type {
+  AgentMode,
   AppSettings,
+  Artifact,
   ChatDraft,
   ChatEventPayload,
   ChatStatus,
@@ -27,6 +33,8 @@ import type {
   Effort,
   Message,
   ModelOption,
+  PermissionRequest,
+  PreviewContent,
   WebPage,
 } from "./types";
 import { Sidebar } from "./components/Sidebar";
@@ -41,6 +49,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   default_deep_think: false,
   default_effort: "high",
   default_model: "deepseek-v4-flash",
+  default_mode: "chat",
   deepseek: {
     api_key: "",
   },
@@ -51,6 +60,16 @@ const DEFAULT_SETTINGS: AppSettings = {
     anysearch_enabled: true,
     strategy: "auto",
     max_results: 5,
+  },
+  gen: {
+    provider: "siliconflow",
+    siliconflow: {
+      api_key: "",
+      base_url: "https://api.siliconflow.cn/v1",
+      image_model: "Kwai-Kolors/Kolors",
+      video_model_i2v: "Wan-AI/Wan2.2-I2V-A14B",
+      video_model_t2v: "Wan-AI/Wan2.2-T2V-A14B",
+    },
   },
 };
 
@@ -65,6 +84,7 @@ function emptyDraft(): ChatDraft {
     reasoning: "",
     content: "",
     searchItems: [],
+    artifacts: [],
     searchProvider: null,
     error: null,
   };
@@ -87,11 +107,12 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [context, setContext] = useState<ContextStatus | null>(null);
-  const [preview, setPreview] = useState<WebPage | null>(null);
+  const [preview, setPreview] = useState<PreviewContent | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [editTarget, setEditTarget] = useState<EditTarget | null>(null);
+  const [permRequest, setPermRequest] = useState<PermissionRequest | null>(null);
   const activeIdRef = useRef<number | null>(null);
   const errorTimerRef = useRef<number | null>(null);
   activeIdRef.current = activeId;
@@ -151,84 +172,9 @@ export default function App() {
     }
   }, [settings.theme]);
 
-  useEffect(() => {
-    const unlistenPromise = onChatEvent((payload: ChatEventPayload) => {
-      handleChatEvent(payload);
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const handleChatEvent = (payload: ChatEventPayload) => {
-    const cid = payload.conversation_id;
-    setDrafts((prev) => {
-      const cur = prev[cid] ?? emptyDraft();
-      let next: ChatDraft = cur;
-      switch (payload.kind) {
-        case "status":
-          next = {
-            ...cur,
-            status:
-              (payload.text as ChatStatus) === "searching"
-                ? "searching"
-                : (payload.text as ChatStatus) === "analyzing"
-                  ? "analyzing"
-                  : (payload.text as ChatStatus) === "answering"
-                    ? "answering"
-                    : "thinking",
-            searchProvider: payload.search_provider ?? cur.searchProvider,
-          };
-          break;
-        case "reasoning_delta":
-          next = { ...cur, reasoning: cur.reasoning + (payload.text ?? "") };
-          break;
-        case "content_delta":
-          next = { ...cur, content: cur.content + (payload.text ?? "") };
-          break;
-        case "search_result":
-          if (payload.item) {
-            next = { ...cur, searchItems: [...cur.searchItems, payload.item] };
-          }
-          break;
-        case "error":
-          next = { ...cur, error: payload.text ?? "生成失败" };
-          break;
-        case "done":
-          return prev;
-      }
-      return { ...prev, [cid]: next };
-    });
-
-    if (payload.kind === "done") {
-      setDrafts((prev) => {
-        const { [cid]: _removed, ...rest } = prev;
-        return rest;
-      });
-      reloadConversations();
-      if (activeIdRef.current === cid) {
-        reloadMessages(cid);
-        refreshContext(cid);
-      }
-    }
-    if (payload.kind === "error") {
-      showError(payload.text ?? "生成失败，请检查 API 配置");
-      if (activeIdRef.current === cid) {
-        reloadMessages(cid);
-        refreshContext(cid);
-      }
-      setDrafts((prev) => {
-        const { [cid]: _removed, ...rest } = prev;
-        return rest;
-      });
-    }
-  };
-
   const reloadConversations = useCallback(async () => {
     try {
-      const list = await getInitialState().then((s) => s.conversations);
-      setConversations(list);
+      setConversations(await getInitialState().then((s) => s.conversations));
     } catch {
       /* ignore */
     }
@@ -250,6 +196,104 @@ export default function App() {
       /* ignore */
     }
   }, []);
+
+  const handleChatEvent = useCallback(
+    (payload: ChatEventPayload) => {
+      const cid = payload.conversation_id;
+      setDrafts((prev) => {
+        const cur = prev[cid] ?? emptyDraft();
+        let next: ChatDraft = cur;
+        switch (payload.kind) {
+        case "status":
+          next = {
+            ...cur,
+            status:
+              (payload.text as ChatStatus) === "searching"
+                ? "searching"
+                : (payload.text as ChatStatus) === "analyzing"
+                  ? "analyzing"
+                  : (payload.text as ChatStatus) === "answering"
+                    ? "answering"
+                    : (payload.text as ChatStatus) === "generating"
+                      ? "generating"
+                      : "thinking",
+            searchProvider: payload.search_provider ?? cur.searchProvider,
+          };
+          break;
+          case "reasoning_delta":
+            next = { ...cur, reasoning: cur.reasoning + (payload.text ?? "") };
+            break;
+          case "content_delta":
+            next = { ...cur, content: cur.content + (payload.text ?? "") };
+            break;
+        case "search_result":
+          if (payload.item && "url" in payload.item) {
+            next = { ...cur, searchItems: [...cur.searchItems, payload.item] };
+          }
+          break;
+        case "artifact":
+          if (payload.item && "path" in payload.item) {
+            next = { ...cur, artifacts: [...cur.artifacts, payload.item as Artifact] };
+          }
+          break;
+        case "permission_request":
+          return prev;
+          case "error":
+            next = { ...cur, error: payload.text ?? "生成失败" };
+            break;
+          case "done":
+            return prev;
+        }
+        return { ...prev, [cid]: next };
+      });
+
+      if (payload.kind === "done") {
+        setDrafts((prev) => {
+          const { [cid]: _removed, ...rest } = prev;
+          return rest;
+        });
+        reloadConversations();
+        if (activeIdRef.current === cid) {
+          reloadMessages(cid);
+          refreshContext(cid);
+        }
+      }
+      if (payload.kind === "permission_request") {
+      setPermRequest({
+        conversation_id: payload.conversation_id,
+        tool: payload.tool ?? "",
+        path: payload.path ?? "",
+      });
+    }
+    if (payload.kind === "video_done") {
+      if (activeIdRef.current === cid) {
+        reloadMessages(cid);
+        refreshContext(cid);
+      } else {
+        reloadConversations();
+      }
+    }
+    if (payload.kind === "error") {
+        showError(payload.text ?? "生成失败，请检查 API 配置");
+        if (activeIdRef.current === cid) {
+          reloadMessages(cid);
+          refreshContext(cid);
+        }
+        setDrafts((prev) => {
+          const { [cid]: _removed, ...rest } = prev;
+          return rest;
+        });
+      }
+    },
+    [reloadConversations, reloadMessages, refreshContext, showError]
+  );
+
+  useEffect(() => {
+    const unlistenPromise = onChatEvent(handleChatEvent);
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [handleChatEvent]);
 
   const selectConversation = useCallback(
     async (id: number) => {
@@ -343,6 +387,7 @@ export default function App() {
         content,
         reasoning: "",
         search_results: [],
+        artifacts: [],
         created_at: Date.now(),
       };
       setMessages((prev) => [...prev, tempUser]);
@@ -365,16 +410,54 @@ export default function App() {
     setPreviewOpen(true);
     setPreviewError(null);
     setPreviewLoading(true);
-    setPreview({ url, title: "", html: "" });
+    setPreview({ kind: "web", url, title: "", html: "" });
     try {
-      const page = await fetchWebPage(url);
-      setPreview(page);
+      const page: WebPage = await fetchWebPage(url);
+      setPreview({ kind: "web", url, title: page.title, html: page.html });
     } catch (e) {
       setPreviewError(String(e));
     } finally {
       setPreviewLoading(false);
     }
   }, []);
+
+  const openFilePreview = useCallback(
+    async (convId: number, path: string, title: string) => {
+      setPreviewOpen(true);
+      setPreviewError(null);
+      setPreviewLoading(true);
+      setPreview({ kind: "file", url: path, title, html: "" });
+      try {
+        const page: WebPage = await fetchFileContent(convId, path);
+        setPreview({ kind: "file", url: page.url, title: page.title, html: page.html });
+      } catch (e) {
+        setPreviewError(String(e));
+      } finally {
+        setPreviewLoading(false);
+      }
+    },
+    []
+  );
+
+  const openMediaPreview = useCallback(
+    async (convId: number, artifact: Artifact) => {
+      setPreviewOpen(true);
+      setPreviewError(null);
+      setPreviewLoading(false);
+      try {
+        const abs = await getArtifactAbsPath(convId, artifact.path);
+        setPreview({
+          kind: artifact.kind as "image" | "video",
+          url: convertFileSrc(abs),
+          title: artifact.name,
+          html: "",
+        });
+      } catch (e) {
+        setPreviewError(String(e));
+      }
+    },
+    []
+  );
 
   const togglePreview = useCallback(() => {
     setPreviewOpen((v) => !v);
@@ -398,6 +481,7 @@ export default function App() {
         content,
         reasoning: "",
         search_results: [],
+        artifacts: [],
         created_at: Date.now(),
       };
       setEditTarget(null);
@@ -486,12 +570,15 @@ export default function App() {
           })
         }
         onSetEffort={(effort: Effort) => patchConversation({ effort })}
+        onSetMode={(mode: AgentMode) => patchConversation({ mode })}
         editTarget={editTarget}
         onCancelEdit={handleCancelEdit}
         onSend={handleSend}
         onSendEdit={handleSendEdit}
         onStop={() => activeId && stopGeneration(activeId)}
         onOpenLink={openWebPreview}
+        onOpenFile={openFilePreview}
+        onOpenArtifact={openMediaPreview}
         onEditMessage={handleEditMessage}
       />
       <WebPreviewPanel
@@ -509,6 +596,42 @@ export default function App() {
         onSave={handleSaveSettings}
         onClearAll={handleClearAll}
       />
+      {permRequest && (
+        <div className="perm-overlay">
+          <div className="perm-dialog">
+            <div className="perm-dialog-title">访问权限确认</div>
+            <div className="perm-dialog-body">
+              <p>AI 助手请求访问<b>会话目录之外</b>的文件：</p>
+              <div className="perm-path">
+                {permRequest.path}
+              </div>
+              <div className="perm-tool">
+                操作：{permRequest.tool}（默认不允许访问会话目录外的文件夹）
+              </div>
+            </div>
+            <div className="perm-dialog-actions">
+              <button
+                className="btn-danger"
+                onClick={() => {
+                  respondPermission(permRequest.conversation_id, false).catch(() => {});
+                  setPermRequest(null);
+                }}
+              >
+                拒绝
+              </button>
+              <button
+                className="btn-primary"
+                onClick={() => {
+                  respondPermission(permRequest.conversation_id, true).catch(() => {});
+                  setPermRequest(null);
+                }}
+              >
+                允许本次访问
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {errorBanner && (
         <div className="error-banner" onClick={dismissError}>
           <span>{errorBanner}</span>

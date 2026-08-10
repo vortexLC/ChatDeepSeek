@@ -16,41 +16,6 @@ const PROFESSIONAL_KEYWORDS: [&str; 32] = [
     "代码", "API", "函数库", "CVE",
 ];
 
-pub fn search_tool_json() -> serde_json::Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "搜索互联网获取实时、最新的信息。推荐策略：简单日常任务、事实类数据检索（如新闻、百科、常识、天气、名人资料）请使用 provider=tavily（快速轻量）；专业垂直领域内容（如财经股票、学术论文、医疗健康、法律条文、代码技术、安全漏洞）请使用 provider=anysearch（专业深度）。provider 默认 auto 由系统智能选择。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索查询关键词，应具体、包含核心实体与限定词，如「2026年5月英伟达财报 营收」"
-                    },
-                    "provider": {
-                        "type": "string",
-                        "enum": ["auto", "tavily", "anysearch"],
-                        "description": "搜索引擎选择：auto 自动 / tavily 日常快速 / anysearch 专业深度，默认 auto"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    })
-}
-
-pub fn search_tool_json_anthropic() -> serde_json::Value {
-    let tool = search_tool_json();
-    let f = &tool["function"];
-    json!({
-        "name": f["name"],
-        "description": f["description"],
-        "input_schema": f["parameters"]
-    })
-}
-
 pub struct SearchOutcome {
     pub items: Vec<SearchItem>,
     pub summary: String,
