@@ -25,5 +25,15 @@ export default defineConfig({
     target: "es2021",
     minify: "esbuild",
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        // 拆分第三方库，避免单个 chunk 过大并提升缓存命中率
+        manualChunks: {
+          react: ["react", "react-dom"],
+          markdown: ["marked", "dompurify"],
+          highlight: ["highlight.js"],
+        },
+      },
+    },
   },
 });

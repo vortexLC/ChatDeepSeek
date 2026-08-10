@@ -16,6 +16,9 @@ scripts/nsis_tauri_utils.dll
 # 技能安装源（已全局安装至 ~/.config/opencode/skills）
 gitea-git-workflow/
 
+# ZCode 会话计划等工具私有文件
+.zcode/
+
 # 系统与编辑器文件
 *.log
 .DS_Store

@@ -1,11 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import type { AgentMode, EditTarget, Effort, ModelOption } from "../types";
+import type {
+  AgentMode,
+  EditTarget,
+  Effort,
+  ModelOption,
+  UploadAttachment,
+} from "../types";
 import {
   BrainIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   GlobeIcon,
   GlobeOffIcon,
+  LinkIcon,
+  PaperclipIcon,
   PencilIcon,
   SendIcon,
   StopIcon,
@@ -17,6 +25,9 @@ const EFFORT_LABELS: Record<string, string> = {
   high: "高",
   max: "最大",
 };
+
+const ACCEPT_TYPES =
+  "image/png,image/jpeg,image/gif,image/webp,image/bmp,.txt,.md,.markdown,.csv,.json,.xml,.yaml,.yml,.log,.ini,.conf,.toml,.sql,.py,.js,.ts,.rs,.java,.c,.cpp,.h,.hpp,.go,.rb,.php,.sh,.bat,.ps1,.html,.css,.scss,.vue,.tsx,.jsx,.pdf";
 
 const MODE_OPTIONS: { value: AgentMode; label: string; title: string }[] = [
   { value: "chat", label: "Chat", title: "普通对话" },
@@ -31,6 +42,7 @@ function modeLabel(mode: AgentMode): string {
 }
 
 interface InputBarProps {
+  resetKey: number;
   disabled: boolean;
   contextFull: boolean;
   streaming: boolean;
@@ -48,12 +60,13 @@ interface InputBarProps {
   onToggleWebSearch: () => void;
   onToggleDeepThink: () => void;
   onSetEffort: (e: Effort) => void;
-  onSend: (content: string) => void;
-  onSendEdit: (content: string) => void;
+  onSend: (content: string, attachments: UploadAttachment[]) => Promise<boolean>;
+  onSendEdit: (content: string, attachments: UploadAttachment[]) => Promise<boolean>;
   onStop: () => void;
 }
 
 export function InputBar({
+  resetKey,
   disabled,
   contextFull,
   streaming,
@@ -77,7 +90,17 @@ export function InputBar({
 }: InputBarProps) {
   const [value, setValue] = useState("");
   const [modeOpen, setModeOpen] = useState(false);
+  const [attachments, setAttachments] = useState<UploadAttachment[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // 切换会话时清空输入与附件
+  useEffect(() => {
+    setValue("");
+    setAttachments([]);
+    setAttachError(null);
+  }, [resetKey]);
 
   useEffect(() => {
     if (editTarget) {
@@ -99,25 +122,68 @@ export function InputBar({
     ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
   }, [value]);
 
-  const canSend = !disabled && !contextFull && !streaming && value.trim().length > 0;
+  const canSend =
+    !disabled &&
+    !contextFull &&
+    !streaming &&
+    (value.trim().length > 0 || attachments.length > 0);
 
   // 保证强度菜单始终包含当前值（兼容旧数据中的 low/none 等）
   const effectiveEffortOptions = effortOptions.includes(effort)
     ? effortOptions
     : [effort, ...effortOptions];
 
-  const submit = () => {
+  const pickFiles = async (files: FileList | null) => {
+    if (!files) return;
+    const next: UploadAttachment[] = [];
+    let err: string | null = null;
+    for (const f of Array.from(files).slice(0, 10)) {
+      if (f.size > 8 * 1024 * 1024) {
+        err = `「${f.name}」超过 8MB，已跳过`;
+        continue;
+      }
+      const kind: "image" | "document" = f.type.startsWith("image/")
+        ? "image"
+        : "document";
+      const data_url = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result ?? ""));
+        reader.onerror = () => resolve("");
+        reader.readAsDataURL(f);
+      });
+      if (data_url) {
+        next.push({
+          name: f.name,
+          mime: f.type || "application/octet-stream",
+          kind,
+          data_url,
+        });
+      }
+    }
+    setAttachError(err);
+    if (next.length > 0) {
+      setAttachments((prev) => [...prev, ...next]);
+    }
+  };
+
+  const submit = async () => {
     if (!canSend) return;
-    if (editTarget) {
-      onSendEdit(value.trim());
-    } else {
-      onSend(value.trim());
+    const text = value.trim();
+    const ok = editTarget
+      ? await onSendEdit(text, attachments)
+      : await onSend(text, attachments);
+    if (!ok) {
+      // 发送失败：保留已输入的文字与附件，避免用户重新输入
+      return;
     }
     setValue("");
+    setAttachments([]);
+    setAttachError(null);
   };
 
   const cancelEdit = () => {
     setValue("");
+    setAttachments([]);
     onCancelEdit();
   };
 
@@ -136,6 +202,36 @@ export function InputBar({
             </button>
           </div>
         )}
+        {attachments.length > 0 && (
+          <div className="input-attachments">
+            {attachments.map((a, i) => (
+              <div key={`${a.name}-${i}`} className="attachment-chip">
+                {a.kind === "image" ? (
+                  <img
+                    className="attachment-thumb"
+                    src={a.data_url}
+                    alt={a.name}
+                  />
+                ) : (
+                  <LinkIcon size={13} />
+                )}
+                <span className="attachment-name" title={a.name}>
+                  {a.name}
+                </span>
+                <button
+                  className="attachment-remove"
+                  title="移除"
+                  onClick={() =>
+                    setAttachments((prev) => prev.filter((_, j) => j !== i))
+                  }
+                >
+                  <XIcon size={10} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {attachError && <div className="attach-error">{attachError}</div>}
         <textarea
           ref={taRef}
           className="input-textarea"
@@ -193,6 +289,25 @@ export function InputBar({
                 </>
               )}
             </div>
+            <button
+              className="tool-btn"
+              title="上传图片或文档（图片需多模态模型）"
+              onClick={() => fileRef.current?.click()}
+              disabled={inputDisabled || streaming}
+            >
+              <PaperclipIcon size={16} />
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              accept={ACCEPT_TYPES}
+              style={{ display: "none" }}
+              onChange={(e) => {
+                pickFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
             <div className="tool-model-select">
               <select
                 value={currentModel}
@@ -222,7 +337,17 @@ export function InputBar({
               {webSearch ? <GlobeIcon size={16} /> : <GlobeOffIcon size={16} />}
               <span className="tool-label">联网</span>
             </button>
-            {deepThink ? (
+            {deepThink && effortOptions.length === 0 ? (
+              <button
+                className="tool-btn on"
+                title="深度思考：开（当前模型协议不支持调节推理强度）"
+                onClick={onToggleDeepThink}
+                disabled={inputDisabled || streaming}
+              >
+                <BrainIcon size={16} />
+                <span className="tool-label">深度思考</span>
+              </button>
+            ) : deepThink ? (
               <div className="effort-wrap">
                 <button
                   className="tool-btn on"

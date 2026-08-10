@@ -206,6 +206,9 @@ impl ContainerSandbox {
             let mut attr_buf = vec![0u8; attr_size];
             let attr_list = attr_buf.as_mut_ptr() as *mut _;
             if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) == 0 {
+                let _ = CloseHandle(out_read);
+                let _ = CloseHandle(out_write);
+                let _ = CloseHandle(in_read);
                 return Err(win_err("InitializeProcThreadAttributeList", GetLastError()));
             }
             if UpdateProcThreadAttribute(
@@ -218,6 +221,9 @@ impl ContainerSandbox {
                 ptr::null_mut(),
             ) == 0
             {
+                let _ = CloseHandle(out_read);
+                let _ = CloseHandle(out_write);
+                let _ = CloseHandle(in_read);
                 return Err(win_err("UpdateProcThreadAttribute", GetLastError()));
             }
 
@@ -248,6 +254,7 @@ impl ContainerSandbox {
             let _ = CloseHandle(out_write);
             let _ = CloseHandle(in_read);
             if ok == 0 {
+                let _ = CloseHandle(out_read);
                 return Err(win_err("CreateProcessW", GetLastError()));
             }
 

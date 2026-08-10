@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "bundle": "tauri build",
-    "bundle:portable": "tauri build && powershell -ExecutionPolicy Bypass -File scripts/package-portable.ps1"
+    "bundle:portable": "tauri build && powershell -ExecutionPolicy Bypass -File scripts/package-portable.ps1",
+    "dev:release": "tauri build --no-bundle && powershell -ExecutionPolicy Bypass -File scripts/run-release.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

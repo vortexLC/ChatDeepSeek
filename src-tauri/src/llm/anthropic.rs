@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use tauri::AppHandle;
 
-use crate::commands::{AppState, DEEPSEEK_ANTHROPIC_BASE, emit};
-use crate::llm::{CancelToken, OutMsg, TurnResult};
+use crate::commands::{AppState, emit};
+use crate::llm::{CancelToken, ImageBlock, OutMsg, TurnResult};
 use crate::models::*;
 
 const MAX_TOKENS: u32 = 16384;
@@ -12,21 +12,25 @@ const MAX_TOKENS: u32 = 16384;
 pub async fn run(
     app: &AppHandle,
     state: &AppState,
+    provider: &ProviderConfig,
+    model: &ModelConfig,
     conv: &Conversation,
-    api_key: &str,
     msgs: &[OutMsg],
     tools: &[serde_json::Value],
     token: &CancelToken,
 ) -> Result<TurnResult, String> {
-    let url = format!("{DEEPSEEK_ANTHROPIC_BASE}/v1/messages");
+    let base = provider.api_base.trim_end_matches('/');
+    let url = format!("{base}/v1/messages");
 
-    let body = build_body(conv, msgs, tools, true);
-    let mut resp = send_request(state, &url, api_key, &body).await?;
+    let body = build_body(model, conv, msgs, tools, true);
+    let mut resp = send_request(state, &url, &provider.api_key, &body).await?;
 
     if resp.status() == 400 {
         // 极少数兼容服务不接受思考模式参数，收到 400 时去掉思考参数重试一次
-        let body2 = build_body(conv, msgs, tools, false);
-        resp = send_request(state, &url, api_key, &body2).await?;
+        // （先消费响应体再重试，避免连接复用被破坏）
+        let _ = resp.text().await;
+        let body2 = build_body(model, conv, msgs, tools, false);
+        resp = send_request(state, &url, &provider.api_key, &body2).await?;
     }
 
     let status = resp.status();
@@ -45,7 +49,15 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            _ = token.wait() => return Err("已停止生成".into()),
+            _ = token.wait() => {
+                // 用户停止：返回已生成的部分内容（reasoning/content），由上层持久化
+                return Ok(TurnResult {
+                    reasoning,
+                    content,
+                    tool_calls: Vec::new(),
+                    stopped: true,
+                });
+            }
             chunk = stream.next() => {
                 let bytes = match chunk {
                     Some(Ok(b)) => b,
@@ -154,17 +166,19 @@ pub async fn run(
         reasoning,
         content,
         tool_calls: tools,
+        stopped: false,
     })
 }
 
 fn build_body(
+    model: &ModelConfig,
     conv: &Conversation,
     msgs: &[OutMsg],
     tools: &[serde_json::Value],
     thinking: bool,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
-        "model": conv.model,
+        "model": model.name,
         "max_tokens": MAX_TOKENS,
         "messages": build_messages_json(msgs),
         "system": build_system_prompt(conv),
@@ -206,6 +220,42 @@ async fn send_request(
         .map_err(|e| format!("请求失败: {e}"))
 }
 
+/// 调用对话模型浓缩早期对话为要点摘要（非流式，供上下文自动压缩使用）
+pub async fn summarize(
+    state: &AppState,
+    provider: &ProviderConfig,
+    model: &ModelConfig,
+    msgs: &[OutMsg],
+) -> Result<String, String> {
+    let base = provider.api_base.trim_end_matches('/');
+    let body = serde_json::json!({
+        "model": model.name,
+        "max_tokens": 600,
+        "system": "你是对话摘要助手。请将给定的多轮对话内容浓缩为一段简洁的中文要点摘要：保留关键事实、用户需求、已得出的结论与尚未完成的事项；丢弃寒暄与无关细节；控制在 300 字以内。只输出摘要本身，不要任何前缀或解释。",
+        "messages": build_messages_json(msgs),
+        "stream": false,
+    });
+    let resp = send_request(state, &format!("{base}/v1/messages"), &provider.api_key, &body).await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error(status.as_u16(), &text));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("摘要响应解析失败: {e}"))?;
+    Ok(v["content"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .next()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default())
+}
+
 fn today_cn() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -231,12 +281,12 @@ fn build_system_prompt(conv: &Conversation) -> String {
         crate::models::MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件。",
         crate::models::MODE_AGENT => "\n\n【当前模式：Agent】你可以使用全部工具：编程工具用于项目开发，generate_image 用于生成图片，generate_video 用于生成视频（耗时约几分钟，完成后会告知保存路径）。",
         crate::models::MODE_IMAGE => "\n\n【当前模式：Image】如果用户要求生成、绘制图片，请调用 generate_image 工具（生成结果会自动保存）。",
-        crate::models::MODE_VIDEO => "\n\n【当前模式：Video】如果用户要求生成视频，请调用 generate_video 工具（文生视频无需图片；图生视频需传图片 URL。生成需几分钟，请告知用户耐心等待）。",
+        crate::models::MODE_VIDEO => "\n\n【当前模式：Video】如果用户要求生成视频，请调用 generate_video 工具，并按需求选择 mode：text2video 文生视频（无需图片）；image2video 图生视频（图片作首帧）；reference2video 参考视频生成（参考图片风格/主体）。图生/参考模式下若用户已在对话中上传图片可不传 image，系统自动使用最近上传的图片。生成需几分钟，请告知用户耐心等待。",
         _ => "",
     };
     let base = if conv.web_search {
         format!(
-            "你是 ChatDeepSeek 智能助手，基于 DeepSeek 大模型构建。今天是 {date}。\n\
+            "你是 ChatDeepSeek 智能助手。今天是 {date}。\n\
 \n\
 请严格遵循以下工作流程处理用户的每个问题：\n\
 1. 【思考】深入理解用户问题：拆解意图、提取关键信息、判断需要哪些实时信息或专业领域数据；\n\
@@ -251,7 +301,7 @@ fn build_system_prompt(conv: &Conversation) -> String {
         )
     } else {
         format!(
-            "你是 ChatDeepSeek 智能助手，基于 DeepSeek 大模型构建。今天是 {date}。\n\
+            "你是 ChatDeepSeek 智能助手。今天是 {date}。\n\
 \n\
 回答用户问题前请先思考：拆解问题意图、整理回答思路，再组织答案。\n\
 回答采用「总-分-总」结构：先给出结论概要，再分点展开说明依据与细节，最后总结要点。\n\
@@ -271,8 +321,27 @@ fn build_messages_json(msgs: &[OutMsg]) -> Vec<serde_json::Value> {
     let mut i = 0;
     while i < msgs.len() {
         match &msgs[i] {
-            OutMsg::User { content } => {
-                result.push(serde_json::json!({"role": "user", "content": content}));
+            OutMsg::User {
+                content,
+                images,
+                docs,
+            } => {
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                let full = if docs.is_empty() {
+                    content.clone()
+                } else {
+                    format!("{docs}\n\n{content}")
+                };
+                if !full.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": full}));
+                }
+                for img in images {
+                    blocks.push(build_image_block(img));
+                }
+                if blocks.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": ""}));
+                }
+                result.push(serde_json::json!({"role": "user", "content": blocks}));
                 i += 1;
             }
             OutMsg::Assistant {
@@ -331,6 +400,18 @@ fn build_messages_json(msgs: &[OutMsg]) -> Vec<serde_json::Value> {
     result
 }
 
+/// 构建 Anthropic 图片块
+pub fn build_image_block(img: &ImageBlock) -> serde_json::Value {
+    serde_json::json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": img.media_type,
+            "data": img.base64,
+        }
+    })
+}
+
 pub fn api_error(status: u16, text: &str) -> String {
     let parsed = serde_json::from_str::<serde_json::Value>(text)
         .ok()
@@ -343,7 +424,7 @@ pub fn api_error(status: u16, text: &str) -> String {
         .unwrap_or_else(|| text.chars().take(300).collect());
     let mut msg = format!("API 错误 ({status}): {parsed}");
     if status == 401 || status == 403 {
-        msg.push_str("。请检查 DeepSeek API Key 是否正确（可在设置面板点击「测试连接」验证）");
+        msg.push_str("。请检查服务商 API Key 是否正确（可在 设置 → 服务商 中测试连接）");
     }
     msg
 }

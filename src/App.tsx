@@ -12,6 +12,8 @@ import {
   getContextStatus,
   getInitialState,
   getMessages,
+  listConversations,
+  listJobs,
   onChatEvent,
   respondPermission,
   saveSettings,
@@ -31,16 +33,19 @@ import type {
   Conversation,
   EditTarget,
   Effort,
+  Job,
   Message,
   ModelOption,
   PermissionRequest,
   PreviewContent,
+  UploadAttachment,
   WebPage,
 } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { WebPreviewPanel } from "./components/WebPreviewPanel";
+import { ToastStack, type ToastItem, type ToastType } from "./components/Toast";
 import { XIcon } from "./components/icons";
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -70,13 +75,33 @@ const DEFAULT_SETTINGS: AppSettings = {
       video_model_i2v: "Wan-AI/Wan2.2-I2V-A14B",
       video_model_t2v: "Wan-AI/Wan2.2-T2V-A14B",
     },
+    alibaba: {
+      api_key: "",
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      image_model: "wanx-v1",
+      video_model_i2v: "",
+      video_model_t2v: "",
+    },
   },
+  providers: [
+    {
+      id: "deepseek",
+      name: "DeepSeek 官方",
+      protocol: "anthropic",
+      api_base: "https://api.deepseek.com/anthropic",
+      api_key: "",
+      models: [
+        { id: "m_flash", name: "deepseek-v4-flash", model_type: "text", video_api: "auto", context_tokens: 131072 },
+        { id: "m_pro", name: "deepseek-v4-pro", model_type: "text", video_api: "auto", context_tokens: 131072 },
+      ],
+    },
+  ],
+  chat_model: { provider_id: "deepseek", model_id: "m_flash" },
+  image_model: null,
+  video_model_t2v: null,
+  video_model_i2v: null,
+  video_model_r2v: null,
 };
-
-const MODEL_OPTIONS: ModelOption[] = [
-  { label: "DeepSeek V4 Flash", model: "deepseek-v4-flash", family: "flash" },
-  { label: "DeepSeek V4 Pro", model: "deepseek-v4-pro", family: "pro" },
-];
 
 function emptyDraft(): ChatDraft {
   return {
@@ -104,6 +129,10 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [drafts, setDrafts] = useState<Record<number, ChatDraft>>({});
+  /** 各会话的异步生成任务（视频）：pending 在会话底部展示任务卡片 */
+  const [jobs, setJobs] = useState<Record<number, Job[]>>({});
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const toastSeqRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [context, setContext] = useState<ContextStatus | null>(null);
@@ -115,6 +144,10 @@ export default function App() {
   const [permRequest, setPermRequest] = useState<PermissionRequest | null>(null);
   const activeIdRef = useRef<number | null>(null);
   const errorTimerRef = useRef<number | null>(null);
+  /** 当前会话请求序号：异步响应（消息/上下文）返回时校验，防止切换会话后旧响应覆盖新会话 */
+  const convReqRef = useRef<number | null>(null);
+  /** 预览请求序号：快速连续点击链接时，丢弃先请求后返回的过期响应 */
+  const previewSeqRef = useRef(0);
   activeIdRef.current = activeId;
 
   const showError = useCallback((msg: string) => {
@@ -125,7 +158,7 @@ export default function App() {
     errorTimerRef.current = window.setTimeout(() => {
       setErrorBanner(null);
       errorTimerRef.current = null;
-    }, 6000);
+    }, 5000);
   }, []);
 
   const dismissError = useCallback(() => {
@@ -134,6 +167,53 @@ export default function App() {
       errorTimerRef.current = null;
     }
     setErrorBanner(null);
+  }, []);
+
+  /** 右上角堆叠通知：异步任务提交/完成/失败 的即时反馈，约 4.5s 自动消失 */
+  const pushToast = useCallback((type: ToastType, text: string) => {
+    const id = ++toastSeqRef.current;
+    setToasts((prev) => [...prev, { id, type, text }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4500);
+  }, []);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  /** 合并/更新一个任务（按 id 去重） */
+  const upsertJob = useCallback((cid: number, job: Job) => {
+    setJobs((prev) => ({
+      ...prev,
+      [cid]: [...(prev[cid] ?? []).filter((j) => j.id !== job.id), job].sort(
+        (a, b) => a.id - b.id
+      ),
+    }));
+  }, []);
+
+  /** 拉取某会话任务列表（同时触发后端恢复重启前未完成的任务轮询）。
+   *  与事件推送合并：事件更新（较新）优先于快照中过期的 pending 状态，
+   *  避免"任务刚完成就被旧快照覆盖回生成中"的竞态 */
+  const reloadJobs = useCallback(async (id: number) => {
+    try {
+      const list = await listJobs(id);
+      setJobs((prev) => {
+        const old = prev[id] ?? [];
+        const merged = list.map((s) => {
+          const o = old.find((j) => j.id === s.id);
+          // 事件已将任务推进到终态（done/failed/canceled）而快照仍为 pending：以事件为准
+          if (o && o.status !== "pending" && s.status === "pending") return o;
+          return s;
+        });
+        for (const o of old) {
+          if (!merged.some((m) => m.id === o.id)) merged.push(o);
+        }
+        return { ...prev, [id]: merged.sort((a, b) => a.id - b.id) };
+      });
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   const activeConversation = useMemo(
@@ -153,6 +233,9 @@ export default function App() {
         if (!mounted) return;
         setConversations(state.conversations);
         setSettings({ ...DEFAULT_SETTINGS, ...state.settings });
+        // 启动时恢复各会话未完成的任务（含重启前的视频任务），
+        // 使侧边栏徽标与完成通知可跨重启持续
+        state.conversations.forEach((c) => reloadJobs(c.id));
       })
       .catch((e) => showError(`初始化失败: ${e}`));
     return () => {
@@ -161,6 +244,7 @@ export default function App() {
         window.clearTimeout(errorTimerRef.current);
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -174,24 +258,32 @@ export default function App() {
 
   const reloadConversations = useCallback(async () => {
     try {
-      setConversations(await getInitialState().then((s) => s.conversations));
+      // 仅刷新会话列表，避免重复拉取完整 settings
+      setConversations(await listConversations());
     } catch {
       /* ignore */
     }
   }, []);
 
   const reloadMessages = useCallback(async (id: number) => {
+    convReqRef.current = id;
     setLoadingMessages(true);
     try {
-      setMessages(await getMessages(id));
+      const list = await getMessages(id);
+      if (convReqRef.current !== id) return; // 已切换会话，丢弃过期响应
+      setMessages(list);
+    } catch {
+      if (convReqRef.current === id) setMessages([]);
     } finally {
-      setLoadingMessages(false);
+      if (convReqRef.current === id) setLoadingMessages(false);
     }
   }, []);
 
   const refreshContext = useCallback(async (id: number) => {
     try {
-      setContext(await getContextStatus(id));
+      const ctx = await getContextStatus(id);
+      if (convReqRef.current !== id) return; // 已切换会话，丢弃过期响应
+      setContext(ctx);
     } catch {
       /* ignore */
     }
@@ -237,6 +329,12 @@ export default function App() {
           }
           break;
         case "permission_request":
+        case "video_submitted":
+        case "video_done":
+        case "video_failed":
+        case "job_canceled":
+        case "stopped":
+          // 非流式事件：不创建/保留空 draft，避免完成后凭空出现空白气泡
           return prev;
           case "error":
             next = { ...cur, error: payload.text ?? "生成失败" };
@@ -258,24 +356,61 @@ export default function App() {
           refreshContext(cid);
         }
       }
-      if (payload.kind === "permission_request") {
+    if (payload.kind === "permission_request") {
       setPermRequest({
         conversation_id: payload.conversation_id,
         tool: payload.tool ?? "",
         path: payload.path ?? "",
       });
+      // 与后端 90 秒超时保持一致：超时后自动关闭弹窗，避免悬挂
+      window.setTimeout(() => setPermRequest(null), 90000);
     }
     if (payload.kind === "video_done") {
+      if (payload.job) upsertJob(cid, payload.job);
+      const name = payload.job?.artifact?.name
+        ?? (payload.item && "path" in payload.item ? (payload.item as Artifact).name : "");
+      pushToast("success", `视频已生成${name ? `：${name}` : ""}`);
+      // 统一刷新会话列表，保证侧边栏时间/排序与完成时间一致
+      reloadConversations();
       if (activeIdRef.current === cid) {
         reloadMessages(cid);
         refreshContext(cid);
+      }
+    }
+    if (payload.kind === "video_submitted") {
+      if (payload.job) upsertJob(cid, payload.job);
+      pushToast("info", "视频任务已提交，正在后台生成…");
+    }
+    if (payload.kind === "video_failed") {
+      if (payload.job) upsertJob(cid, payload.job);
+      pushToast("error", payload.text ?? "视频生成失败");
+    }
+    if (payload.kind === "job_canceled") {
+      if (payload.job) upsertJob(cid, payload.job);
+      pushToast("info", "视频任务已取消");
+    }
+    if (payload.kind === "stopped") {
+      // 用户主动停止：非错误。先等持久化的部分内容加载回来，再移除流式气泡，
+      // 避免已生成内容短暂闪现消失
+      const removeDraft = () => {
+        setDrafts((prev) => {
+          const { [cid]: _removed, ...rest } = prev;
+          return rest;
+        });
+      };
+      if (activeIdRef.current === cid) {
+        reloadMessages(cid).then(() => {
+          removeDraft();
+          refreshContext(cid);
+        });
       } else {
-        reloadConversations();
+        removeDraft();
       }
     }
     if (payload.kind === "error") {
-        showError(payload.text ?? "生成失败，请检查 API 配置");
+        // 仅当前活动会话的错误弹横幅；后台会话的错误只清理其 draft，避免误导
         if (activeIdRef.current === cid) {
+          showError(payload.text ?? "生成失败，请检查 API 配置");
           reloadMessages(cid);
           refreshContext(cid);
         }
@@ -285,7 +420,7 @@ export default function App() {
         });
       }
     },
-    [reloadConversations, reloadMessages, refreshContext, showError]
+    [reloadConversations, reloadMessages, refreshContext, showError, pushToast, upsertJob]
   );
 
   useEffect(() => {
@@ -302,9 +437,10 @@ export default function App() {
       setContext(null);
       setEditTarget(null);
       reloadMessages(id);
+      reloadJobs(id);
       refreshContext(id);
     },
-    [reloadMessages, refreshContext]
+    [reloadMessages, reloadJobs, refreshContext]
   );
 
   const newConversation = useCallback(async () => {
@@ -333,9 +469,19 @@ export default function App() {
 
   const removeConversation = useCallback(
     async (id: number) => {
-      await deleteConversation(id);
+      try {
+        await deleteConversation(id);
+      } catch (e) {
+        // 删除失败（目录被占用等）：保留会话并提示，避免数据残留却从列表消失
+        showError(`删除对话失败: ${e}`);
+        return;
+      }
       setConversations((prev) => prev.filter((c) => c.id !== id));
       setDrafts((prev) => {
+        const { [id]: _removed, ...rest } = prev;
+        return rest;
+      });
+      setJobs((prev) => {
         const { [id]: _removed, ...rest } = prev;
         return rest;
       });
@@ -346,25 +492,13 @@ export default function App() {
         setEditTarget(null);
       }
     },
-    [activeId]
+    [activeId, showError]
   );
 
   const patchConversation = useCallback(
-    (
-      patch: ConversationUpdate,
-      adjustEffortFor?: ModelOption
-    ) => {
+    (patch: ConversationUpdate) => {
       if (!activeId || !activeConversation) return;
-      const family = adjustEffortFor
-        ? adjustEffortFor.family
-        : activeConversation.model.includes("flash")
-          ? "flash"
-          : "pro";
-      let effort = patch.effort ?? activeConversation.effort;
-      if (family === "pro" && (effort === "low" || effort === "none")) {
-        effort = "high";
-      }
-      const normalized: ConversationUpdate = { ...patch, effort };
+      const normalized: ConversationUpdate = { ...patch };
       setConversations((prev) =>
         prev.map((c) => (c.id === activeId ? { ...c, ...normalized } : c))
       );
@@ -374,11 +508,12 @@ export default function App() {
   );
 
   const handleSend = useCallback(
-    async (content: string) => {
-      if (!activeId) return;
+    async (content: string, attachments: UploadAttachment[] = []): Promise<boolean> => {
+      if (!activeId) return false;
+      if (content.trim() === "" && attachments.length === 0) return false;
       if (context?.full) {
         showError("上下文已满，请新开会话");
-        return;
+        return false;
       }
       const tempUser: Message = {
         id: -Date.now(),
@@ -388,12 +523,20 @@ export default function App() {
         reasoning: "",
         search_results: [],
         artifacts: [],
+        attachments: attachments.map((a) => ({
+          name: a.name,
+          mime: a.mime,
+          kind: a.kind,
+          path: a.data_url,
+          size: 0,
+        })),
         created_at: Date.now(),
       };
       setMessages((prev) => [...prev, tempUser]);
       setDrafts((prev) => ({ ...prev, [activeId]: emptyDraft() }));
       try {
-        await sendMessage(activeId, content);
+        await sendMessage(activeId, content, attachments);
+        return true;
       } catch (e) {
         showError(`发送失败: ${e}`);
         setMessages((prev) => prev.filter((m) => m.id !== tempUser.id));
@@ -401,51 +544,62 @@ export default function App() {
           const { [activeId]: _removed, ...rest } = prev;
           return rest;
         });
+        return false;
       }
     },
     [activeId, context]
   );
 
   const openWebPreview = useCallback(async (url: string) => {
+    const seq = ++previewSeqRef.current;
     setPreviewOpen(true);
     setPreviewError(null);
     setPreviewLoading(true);
     setPreview({ kind: "web", url, title: "", html: "" });
     try {
       const page: WebPage = await fetchWebPage(url);
+      if (seq !== previewSeqRef.current) return; // 已点击其它链接，丢弃过期响应
       setPreview({ kind: "web", url, title: page.title, html: page.html });
     } catch (e) {
+      if (seq !== previewSeqRef.current) return;
+      showError(`预览加载失败: ${e}`);
       setPreviewError(String(e));
     } finally {
-      setPreviewLoading(false);
+      if (seq === previewSeqRef.current) setPreviewLoading(false);
     }
-  }, []);
+  }, [showError]);
 
   const openFilePreview = useCallback(
     async (convId: number, path: string, title: string) => {
+      const seq = ++previewSeqRef.current;
       setPreviewOpen(true);
       setPreviewError(null);
       setPreviewLoading(true);
       setPreview({ kind: "file", url: path, title, html: "" });
       try {
         const page: WebPage = await fetchFileContent(convId, path);
+        if (seq !== previewSeqRef.current) return;
         setPreview({ kind: "file", url: page.url, title: page.title, html: page.html });
       } catch (e) {
+        if (seq !== previewSeqRef.current) return;
+        showError(`文件预览失败: ${e}`);
         setPreviewError(String(e));
       } finally {
-        setPreviewLoading(false);
+        if (seq === previewSeqRef.current) setPreviewLoading(false);
       }
     },
-    []
+    [showError]
   );
 
   const openMediaPreview = useCallback(
     async (convId: number, artifact: Artifact) => {
+      const seq = ++previewSeqRef.current;
       setPreviewOpen(true);
       setPreviewError(null);
       setPreviewLoading(false);
       try {
         const abs = await getArtifactAbsPath(convId, artifact.path);
+        if (seq !== previewSeqRef.current) return;
         setPreview({
           kind: artifact.kind as "image" | "video",
           url: convertFileSrc(abs),
@@ -453,10 +607,12 @@ export default function App() {
           html: "",
         });
       } catch (e) {
+        if (seq !== previewSeqRef.current) return;
+        showError(`预览失败: ${e}`);
         setPreviewError(String(e));
       }
     },
-    []
+    [showError]
   );
 
   const togglePreview = useCallback(() => {
@@ -472,8 +628,8 @@ export default function App() {
   }, []);
 
   const handleSendEdit = useCallback(
-    async (content: string) => {
-      if (!activeId || !editTarget) return;
+    async (content: string, attachments: UploadAttachment[] = []): Promise<boolean> => {
+      if (!activeId || !editTarget) return false;
       const tempUser: Message = {
         id: -Date.now(),
         conversation_id: activeId,
@@ -482,9 +638,15 @@ export default function App() {
         reasoning: "",
         search_results: [],
         artifacts: [],
+        attachments: attachments.map((a) => ({
+          name: a.name,
+          mime: a.mime,
+          kind: a.kind,
+          path: a.data_url,
+          size: 0,
+        })),
         created_at: Date.now(),
       };
-      setEditTarget(null);
       setMessages((prev) => {
         const idx = prev.findIndex((m) => m.id === editTarget.id);
         if (idx < 0) return [...prev, tempUser];
@@ -492,20 +654,55 @@ export default function App() {
       });
       setDrafts((prev) => ({ ...prev, [activeId]: emptyDraft() }));
       try {
-        await editAndResend(activeId, editTarget.id, content);
+        await editAndResend(activeId, editTarget.id, content, attachments);
+        setEditTarget(null);
+        return true;
       } catch (e) {
         showError(`发送失败: ${e}`);
-        setMessages((prev) => prev.filter((m) => m.id !== tempUser.id));
+        // 回滚被截断的历史消息（重新拉取），避免编辑点之后的消息从界面"变短"
+        reloadMessages(activeId);
         setDrafts((prev) => {
           const { [activeId]: _removed, ...rest } = prev;
           return rest;
         });
+        return false;
       }
     },
     [activeId, editTarget]
   );
 
-  const modelOptions: ModelOption[] = MODEL_OPTIONS;
+  // 对话模型选项：所有已添加的文本/多模态模型（按提供商分组）
+  const chatModelOptions = useMemo(() => {
+    const options: ModelOption[] = [];
+    for (const p of settings.providers) {
+      for (const m of p.models) {
+        if (m.model_type === "text" || m.model_type === "vision") {
+          options.push({
+            label: `${p.name} / ${m.name}`,
+            model: m.id,
+            modelType: m.model_type,
+            protocol: p.protocol,
+          });
+        }
+      }
+    }
+    return options;
+  }, [settings.providers]);
+
+  // 默认对话模型：与后端 resolve_chat_model 保持一致
+  // （设置 → 模型选择 中的对话模型优先，否则取第一个文本/视觉模型），
+  // 用于在会话未单独选择模型时让发送框显示与设置一致的模型
+  const defaultChatModelId = useMemo(() => {
+    const sel = settings.chat_model;
+    if (sel) {
+      const p = settings.providers.find((x) => x.id === sel.provider_id);
+      const m = p?.models.find((mm) => mm.id === sel.model_id);
+      if (p && m && (m.model_type === "text" || m.model_type === "vision")) {
+        return m.id;
+      }
+    }
+    return chatModelOptions[0]?.model ?? "";
+  }, [settings.providers, settings.chat_model, chatModelOptions]);
 
   const handleSaveSettings = useCallback(async (next: AppSettings) => {
     setSettings(next);
@@ -523,6 +720,7 @@ export default function App() {
       setActiveId(null);
       setMessages([]);
       setDrafts({});
+      setJobs({});
       setContext(null);
       setEditTarget(null);
       setPreview(null);
@@ -532,11 +730,28 @@ export default function App() {
     }
   }, []);
 
+  /** 各会话进行中任务数量（侧边栏"生成中"徽标） */
+  const pendingJobCounts = useMemo(() => {
+    const m: Record<number, number> = {};
+    for (const [cid, list] of Object.entries(jobs)) {
+      const n = list.filter((j) => j.status === "pending").length;
+      if (n > 0) m[Number(cid)] = n;
+    }
+    return m;
+  }, [jobs]);
+
+  /** 当前会话任务列表（引用稳定，配合 MessageItem 的 memo 避免流式期间全量重渲染） */
+  const activeJobs = useMemo(
+    () => (activeId ? (jobs[activeId] ?? []) : []),
+    [jobs, activeId]
+  );
+
   return (
     <div className="app">
       <Sidebar
         conversations={conversations}
         activeId={activeId}
+        pendingJobs={pendingJobCounts}
         onSelect={selectConversation}
         onNew={newConversation}
         onDelete={removeConversation}
@@ -548,17 +763,20 @@ export default function App() {
         messages={messages}
         loadingMessages={loadingMessages}
         draft={activeDraft}
+        jobs={activeJobs}
         context={context}
         onNewConversation={newConversation}
         previewOpen={previewOpen}
         onTogglePreview={togglePreview}
-        modelOptions={modelOptions}
-        onSelectModel={(option) =>
-          patchConversation(
-            { provider: "anthropic", model: option.model },
-            option
-          )
-        }
+        modelOptions={chatModelOptions}
+        defaultModel={defaultChatModelId}
+        onSelectModel={(option) => {
+          const p = settings.providers.find((x) =>
+            x.models.some((m) => m.id === option.model)
+          );
+          if (!p) return;
+          patchConversation({ provider: p.id, model: option.model });
+        }}
         onToggleWebSearch={() =>
           patchConversation({
             web_search: !(activeConversation?.web_search ?? false),
@@ -640,6 +858,7 @@ export default function App() {
           </button>
         </div>
       )}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }

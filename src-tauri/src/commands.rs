@@ -11,6 +11,146 @@ use crate::models::*;
 
 pub const DEEPSEEK_ANTHROPIC_BASE: &str = "https://api.deepseek.com/anthropic";
 const MAX_WEBPAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// 待保存的附件（前端 FileReader 得到的 data URL）
+#[derive(serde::Deserialize)]
+pub struct UploadAttachment {
+    pub name: String,
+    pub mime: String,
+    pub data_url: String,
+}
+
+/// 允许作为文档附件的扩展名（文本类 + PDF）
+const DOC_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "csv", "json", "xml", "yaml", "yml", "log", "ini", "conf", "toml",
+    "sql", "py", "js", "ts", "rs", "java", "c", "cpp", "h", "hpp", "go", "rb", "php", "sh",
+    "bat", "ps1", "html", "css", "scss", "vue", "tsx", "jsx", "pdf",
+];
+
+fn classify_upload(name: &str, mime: &str) -> Result<(String, String), String> {
+    if mime.starts_with("image/") {
+        // SVG 可内嵌脚本（且旧逻辑会以 jpg 扩展名保存导致损坏），直接拒绝
+        if mime == "image/svg+xml" || name.to_lowercase().ends_with(".svg") {
+            return Err(format!(
+                "不支持该附件类型（{name}）：SVG 图片可能携带脚本，请转换为 PNG/JPEG 后上传"
+            ));
+        }
+        let ext = match mime {
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            "image/bmp" => "bmp",
+            _ => "jpg",
+        };
+        return Ok((ext.to_string(), "image".to_string()));
+    }
+    let ext = name
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    if DOC_EXTENSIONS.contains(&ext.as_str()) {
+        return Ok((ext, "document".to_string()));
+    }
+    Err(format!(
+        "不支持该附件类型（{name}）：请上传图片或文本/PDF 文档"
+    ))
+}
+
+/// 校验上传附件是否含图片且当前对话模型支持图片输入（落盘前调用，避免孤儿附件文件）
+fn check_uploads_model(
+    settings: &AppSettings,
+    conv: &Conversation,
+    uploads: &[UploadAttachment],
+) -> Result<(), String> {
+    let has_image = uploads.iter().any(|u| u.mime.starts_with("image/"));
+    if has_image {
+        if let Some((_, m)) = settings.resolve_chat_model(conv) {
+            if m.model_type != crate::models::MODEL_TYPE_VISION {
+                return Err(format!(
+                    "当前对话模型「{}」不支持图片输入，请选择多模态（视觉）模型，或仅上传文档/文本文件",
+                    m.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 保存前端上传的附件到会话 uploads/ 目录
+fn save_attachments(
+    state: &AppState,
+    conv_id: i64,
+    atts: &[UploadAttachment],
+) -> Result<Vec<crate::models::Attachment>, String> {
+    if atts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dir = state.db.session_uploads_dir(conv_id);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    use base64::Engine;
+    let mut out = Vec::new();
+    for (i, a) in atts.iter().enumerate() {
+        let (ext, kind) = classify_upload(&a.name, &a.mime)?;
+        let b64 = a.data_url.split(',').last().unwrap_or("");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("附件「{}」解码失败: {e}", a.name))?;
+        if bytes.is_empty() {
+            return Err(format!("附件「{}」内容为空", a.name));
+        }
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(format!("附件「{}」过大（超过 8MB）", a.name));
+        }
+        let fname = format!("att_{}_{}.{}", crate::db::now_ms(), i, ext);
+        std::fs::write(dir.join(&fname), &bytes)
+            .map_err(|e| format!("保存附件失败: {e}"))?;
+        out.push(crate::models::Attachment {
+            name: a.name.clone(),
+            mime: if kind == "image" && !a.mime.starts_with("image/") {
+                format!("image/{ext}")
+            } else {
+                a.mime.clone()
+            },
+            kind,
+            path: format!("uploads/{fname}"),
+            size: bytes.len() as i64,
+        });
+    }
+    Ok(out)
+}
+
+/// 取会话中最近一条用户消息里的第一张图片附件，转换为 data URL（供图生视频等使用）
+pub fn latest_user_image_data_url(state: &AppState, conv_id: i64) -> Option<String> {
+    let rows = state.db.list_messages_full(conv_id).ok()?;
+    for row in rows.iter().rev() {
+        if row.role != "user" {
+            continue;
+        }
+        let atts: Vec<crate::models::Attachment> =
+            serde_json::from_str(&row.attachments).unwrap_or_default();
+        for att in atts {
+            if att.kind != "image" {
+                continue;
+            }
+            let p = state.db.session_abs_path(conv_id, &att.path)?;
+            let bytes = std::fs::read(p).ok()?;
+            if bytes.is_empty() {
+                continue;
+            }
+            use base64::Engine;
+            let mime = if att.mime.starts_with("image/") {
+                att.mime.clone()
+            } else {
+                "image/jpeg".into()
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Some(format!("data:{mime};base64,{b64}"));
+        }
+    }
+    None
+}
 
 pub struct AppState {
     pub db: Db,
@@ -40,6 +180,10 @@ impl AppState {
 
 /// 取消某会话的所有后台任务（删除/编辑会话时调用）
 pub fn cancel_session_tasks(state: &AppState, conv_id: i64) {
+    // 进行中的 agent（流式生成）同样取消，避免删除/编辑后继续运行并写库
+    if let Some(t) = state.cancels.lock().unwrap().remove(&conv_id) {
+        t.cancel();
+    }
     let prefix = format!("video-{conv_id}");
     let mut tasks = state.bg_tasks.lock().unwrap();
     let keys: Vec<String> = tasks
@@ -51,6 +195,19 @@ pub fn cancel_session_tasks(state: &AppState, conv_id: i64) {
         if let Some(t) = tasks.remove(&k) {
             t.cancel();
         }
+    }
+    drop(tasks);
+    // 数据库中的未完成任务同步标记为已取消
+    let _ = state.db.cancel_jobs_for_session(conv_id);
+}
+
+/// 退出应用时取消所有进行中的任务，释放网络连接与系统资源
+pub fn cancel_all_tasks(state: &AppState) {
+    for t in state.cancels.lock().unwrap().values() {
+        t.cancel();
+    }
+    for t in state.bg_tasks.lock().unwrap().values() {
+        t.cancel();
     }
 }
 
@@ -75,7 +232,10 @@ pub async fn request_permission(
         "path": path,
     });
     let _ = app.emit("chat_event", payload);
-    match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(90), rx).await;
+    // 无论结果如何都清理槽位，避免超时/取消后残留过期条目
+    state.pending_perms.lock().unwrap().remove(&conversation_id);
+    match result {
         Ok(Ok(true)) => Ok(true),
         Ok(Ok(false)) => Err(format!("用户拒绝了该操作：{tool} {path}")),
         Ok(Err(_)) => Err("权限确认已失效".into()),
@@ -105,7 +265,7 @@ pub fn list_conversations(state: State<Arc<AppState>>) -> Result<Vec<Conversatio
 #[tauri::command]
 pub fn create_conversation(state: State<Arc<AppState>>) -> Result<Conversation, String> {
     let settings = state.db.get_settings();
-    Ok(state.db.create_conversation(&settings))
+    state.db.create_conversation(&settings)
 }
 
 #[tauri::command]
@@ -123,9 +283,23 @@ pub fn delete_conversation(state: State<Arc<AppState>>, id: i64) -> Result<(), S
     state.db.delete_conversation(id)
 }
 
+/// 列出会话的异步生成任务（视频等）；
+/// 若存在未完成且无存活轮询的任务（如应用重启后），自动恢复后台轮询
+#[tauri::command]
+pub fn list_jobs(
+    app: AppHandle,
+    state: State<Arc<AppState>>,
+    conversation_id: i64,
+) -> Result<Vec<Job>, String> {
+    crate::agent::generate::resume_jobs(&state, &app, conversation_id);
+    state.db.list_jobs(conversation_id)
+}
+
 #[tauri::command]
 pub fn clear_all_conversations(state: State<Arc<AppState>>) -> Result<(), String> {
-    state.bg_tasks.lock().unwrap().clear();
+    // 先取消所有进行中的任务（agent + 视频轮询），否则它们会在目录删除后继续
+    // 轮询/写库，把已清空的会话目录与消息库"复活"成僵尸数据
+    cancel_all_tasks(&state);
     state.db.clear_all()
 }
 
@@ -161,6 +335,7 @@ pub async fn send_message(
     state: State<'_, Arc<AppState>>,
     conversation_id: i64,
     content: String,
+    attachments: Option<Vec<UploadAttachment>>,
 ) -> Result<(), String> {
     let conv = state
         .db
@@ -169,16 +344,15 @@ pub async fn send_message(
 
     let settings = state.db.get_settings();
 
-    let key = settings.deepseek.api_key.clone();
-    if key.trim().is_empty() {
-        return err("未配置 API Key，请在设置面板中填写 DeepSeek API Key");
-    }
-
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
+    let trimmed = content.trim().to_string();
+    let uploads = attachments.unwrap_or_default();
+    if trimmed.is_empty() && uploads.is_empty() {
         return err("消息内容为空");
     }
 
+    // 先校验再落盘：模型不支持图片 / 上下文已满时直接拒绝，
+    // 避免上传文件已写入 uploads/ 却无法发送的孤儿文件
+    check_uploads_model(&settings, &conv, &uploads)?;
     let usage = state.db.context_usage(conversation_id);
     if usage.full {
         return err("上下文已满，请新开会话");
@@ -187,16 +361,26 @@ pub async fn send_message(
         return err("当前对话正在生成中，请先停止或等待完成");
     }
 
+    let saved_atts = save_attachments(&state, conversation_id, &uploads)?;
+
     state
         .db
-        .insert_message(conversation_id, "user", trimmed, "", "[]", "[]", &[], &[])
+        .insert_message_with_attachments(
+            conversation_id,
+            "user",
+            &trimmed,
+            "",
+            "[]",
+            "[]",
+            &[],
+            &[],
+            &saved_atts,
+        )
         .map_err(|e| e.to_string())?;
-    state.db.set_title_if_default(conversation_id, trimmed);
+    state.db.set_title_if_default(conversation_id, &trimmed);
     state.db.touch(conversation_id);
 
-    spawn_agent(app, state.inner().clone(), conv, settings, conversation_id);
-
-    Ok(())
+    spawn_agent(app, state.inner().clone(), conv, settings, conversation_id)
 }
 
 /// 编辑已发送的用户消息：删除该消息及其后所有消息，以新内容重新生成
@@ -207,6 +391,7 @@ pub async fn edit_and_resend(
     conversation_id: i64,
     message_id: i64,
     content: String,
+    attachments: Option<Vec<UploadAttachment>>,
 ) -> Result<(), String> {
     let conv = state
         .db
@@ -219,16 +404,36 @@ pub async fn edit_and_resend(
     if row.role != "user" {
         return err("只能编辑用户发送的消息");
     }
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
+    let trimmed = content.trim().to_string();
+    let uploads = attachments.unwrap_or_default();
+    if trimmed.is_empty() && uploads.is_empty() {
         return err("消息内容为空");
     }
     if state.cancels.lock().unwrap().contains_key(&conversation_id) {
         return err("当前对话正在生成中，请先停止或等待完成");
     }
 
+    // 未重新上传附件时沿用原消息附件
+    let old_atts: Vec<crate::models::Attachment> =
+        serde_json::from_str(&row.attachments).unwrap_or_default();
+    // 先校验再落盘，避免孤儿附件文件
+    check_uploads_model(&state.db.get_settings(), &conv, &uploads)?;
+    let saved_atts = if uploads.is_empty() {
+        old_atts
+    } else {
+        save_attachments(&state, conversation_id, &uploads)?
+    };
+
     state.db.delete_messages_from(conversation_id, message_id)?;
     cancel_session_tasks(&state, conversation_id);
+
+    // 编辑点已进入摘要范围时压缩状态失效：重置摘要，避免旧摘要与编辑后的
+    // 新对话线程语义漂移（编辑内容不会出现在旧摘要中）
+    if let Some(c) = state.db.get_conversation(conversation_id) {
+        if message_id <= c.summarized_until {
+            let _ = state.db.update_conversation_summary(conversation_id, "", 0);
+        }
+    }
 
     let usage = state.db.context_usage(conversation_id);
     if usage.full {
@@ -237,33 +442,51 @@ pub async fn edit_and_resend(
 
     state
         .db
-        .insert_message(conversation_id, "user", trimmed, "", "[]", "[]", &[], &[])
+        .insert_message_with_attachments(
+            conversation_id,
+            "user",
+            &trimmed,
+            "",
+            "[]",
+            "[]",
+            &[],
+            &[],
+            &saved_atts,
+        )
         .map_err(|e| e.to_string())?;
     state.db.touch(conversation_id);
 
+    // 以最新会话快照启动 agent（压缩状态可能已被重置）
+    let conv = state
+        .db
+        .get_conversation(conversation_id)
+        .ok_or_else(|| "对话不存在".to_string())?;
     let settings = state.db.get_settings();
-    spawn_agent(app, state.inner().clone(), conv, settings, conversation_id);
-
-    Ok(())
+    spawn_agent(app, state.inner().clone(), conv, settings, conversation_id)
 }
 
+/// 启动 agent 后台任务；"检查是否正在生成 + 注册取消令牌"在同一临界区内完成，
+/// 防止并发调用同时通过检查导致同一会话双 agent 并行
 fn spawn_agent(
     app: AppHandle,
     state: Arc<AppState>,
     conv: Conversation,
     settings: AppSettings,
     conversation_id: i64,
-) {
+) -> Result<(), String> {
     let token = Arc::new(CancelToken::new());
-    state
-        .cancels
-        .lock()
-        .unwrap()
-        .insert(conversation_id, token.clone());
+    {
+        let mut cancels = state.cancels.lock().unwrap();
+        if cancels.contains_key(&conversation_id) {
+            return err("当前对话正在生成中，请先停止或等待完成");
+        }
+        cancels.insert(conversation_id, token.clone());
+    }
     tokio::spawn(async move {
         run_agent(app, state.clone(), conv, settings, token).await;
         state.cancels.lock().unwrap().remove(&conversation_id);
     });
+    Ok(())
 }
 
 #[tauri::command]
@@ -296,6 +519,7 @@ pub async fn test_deepseek_connection(
         .post(url)
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
+        .timeout(std::time::Duration::from_secs(30))
         .json(&body)
         .send()
         .await
@@ -306,6 +530,156 @@ pub async fn test_deepseek_connection(
         Ok("连接成功，API Key 有效，可正常使用 deepseek-v4-flash / deepseek-v4-pro".into())
     } else {
         Err(crate::llm::anthropic::api_error(status.as_u16(), &text))
+    }
+}
+
+/// 获取硅基流动账户当前可用的视频生成模型列表（用于设置面板下拉选择与自动回退）
+#[tauri::command]
+pub async fn list_sf_video_models(
+    state: State<'_, Arc<AppState>>,
+    api_key: String,
+    base_url: String,
+) -> Result<Vec<String>, String> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Err("未配置硅基流动 API Key，请先填写 API Key".into());
+    }
+    let base = base_url.trim().trim_end_matches('/');
+    let url = format!("{base}/models?type=video");
+    let resp = state
+        .client
+        .get(url)
+        .bearer_auth(key)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("获取视频模型列表失败: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "获取视频模型列表失败 ({status}): {}",
+            text.chars().take(200).collect::<String>()
+        ));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("模型列表解析失败: {e}"))?;
+    let models: Vec<String> = v["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if models.is_empty() {
+        return Err(
+            "账户下暂无可用视频模型（视频模型需先在 cloud.siliconflow.cn 模型广场中开通）".into(),
+        );
+    }
+    Ok(models)
+}
+
+/// 测试服务商下某个模型是否可用（按模型类型分别测试）
+#[tauri::command]
+pub async fn test_model(
+    state: State<'_, Arc<AppState>>,
+    provider: crate::models::ProviderConfig,
+    model: crate::models::ModelConfig,
+) -> Result<String, String> {
+    let key = provider.api_key.trim();
+    if key.is_empty() {
+        return Err("未填写该服务商的 API Key".into());
+    }
+    let base = provider.api_base.trim_end_matches('/');
+    let anthropic = provider.protocol == crate::models::PROTOCOL_ANTHROPIC;
+
+    match model.model_type.as_str() {
+        crate::models::MODEL_TYPE_TEXT | crate::models::MODEL_TYPE_VISION => {
+            let body = serde_json::json!({
+                "model": model.name,
+                "max_tokens": 4,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            });
+            let url = if anthropic {
+                format!("{base}/v1/messages")
+            } else {
+                format!("{base}/chat/completions")
+            };
+            let mut req = state.client.post(url);
+            if anthropic {
+                req = req
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01");
+            } else {
+                req = req.bearer_auth(key);
+            }
+            let resp = req
+                .timeout(std::time::Duration::from_secs(30))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("网络请求失败: {e}"))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                Ok(format!("「{}」连接成功，模型可用", model.name))
+            } else {
+                Err(format!(
+                    "「{}」测试失败 ({status}): {}",
+                    model.name,
+                    text.chars().take(200).collect::<String>()
+                ))
+            }
+        }
+        crate::models::MODEL_TYPE_IMAGE => {
+            let body = serde_json::json!({
+                "model": model.name,
+                "prompt": "a red circle",
+                "n": 1,
+            });
+            let resp = state
+                .client
+                .post(format!("{base}/images/generations"))
+                .bearer_auth(key)
+                .timeout(std::time::Duration::from_secs(60))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("网络请求失败: {e}"))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                Ok(format!("「{}」图片生成接口可用（已生成测试图片，未保存）", model.name))
+            } else {
+                Err(format!(
+                    "「{}」测试失败 ({status}): {}",
+                    model.name,
+                    text.chars().take(200).collect::<String>()
+                ))
+            }
+        }
+        crate::models::MODEL_TYPE_VIDEO => {
+            // 视频生成不实际提交任务，仅验证认证与接口可达
+            let resp = state
+                .client
+                .get(format!("{base}/models"))
+                .bearer_auth(key)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| format!("网络请求失败: {e}"))?;
+            let status = resp.status();
+            if status == 401 || status == 403 {
+                Err(format!("「{}」认证失败 ({status})：API Key 无效或未授权", model.name))
+            } else if status.is_success() || status == 404 {
+                Ok(format!("「{}」认证通过；视频生成将在实际生成时验证", model.name))
+            } else {
+                Err(format!("「{}」测试失败 ({status})", model.name))
+            }
+        }
+        _ => Err("未知模型类型".into()),
     }
 }
 
@@ -334,26 +708,37 @@ fn is_ssrf_target(url: &str) -> bool {
         // 域名无法解析，视为不可信目标
         return true;
     }
-    ips.into_iter().any(|ip| match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 10
-                || o[0] == 127
-                || o[0] == 0
-                || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 169 && o[1] == 254)
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || o[0] >= 224
-        }
+    ips.into_iter().any(is_blocked_ip)
+}
+
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_v4(v4),
         std::net::IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6（如 ::ffff:127.0.0.1）还原为 IPv4 后再检查，
+            // 否则可绕过回环/内网拦截
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_v4(v4);
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (v6.segments()[0] & 0xfe00 == 0xfc00)
                 || v6.segments()[0] == 0xfe80
         }
-    })
+    }
+}
+
+fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 10
+        || o[0] == 127
+        || o[0] == 0
+        || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || o[0] >= 224
 }
 
 /// 抓取网页，返回可安全渲染的页面 HTML（保留结构/样式/图片，剔除脚本等危险内容），供右侧预览面板展示
@@ -365,21 +750,49 @@ pub async fn fetch_webpage(
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return err("仅支持 http/https 链接");
     }
-    if is_ssrf_target(&url) {
-        return err("出于安全考虑，仅允许访问公网地址");
-    }
-    let resp = state
-        .client
-        .get(&url)
-        .header(
-            "user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        )
-        .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .timeout(std::time::Duration::from_secs(20))
-        .send()
-        .await
-        .map_err(|e| format!("网页请求失败: {e}"))?;
+    // 手动跟随重定向（reqwest 默认跟随策略无法逐跳复检）：
+    // 每一跳都重新校验目标地址，防止通过重定向跳转到内网/回环地址（SSRF 绕过）
+    let mut current = url;
+    let mut redirects = 0usize;
+    let resp = loop {
+        if is_ssrf_target(&current) {
+            return err("出于安全考虑，仅允许访问公网地址");
+        }
+        let resp = state
+            .client
+            .get(&current)
+            .header(
+                "user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            )
+            .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await
+            .map_err(|e| format!("网页请求失败: {e}"))?;
+        if resp.status().is_redirection() {
+            redirects += 1;
+            if redirects > 5 {
+                return err("重定向次数过多，已停止");
+            }
+            let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                return err("重定向响应缺少 Location 头");
+            };
+            current = resp
+                .url()
+                .join(loc)
+                .map(|u| u.to_string())
+                .map_err(|e| format!("重定向地址无效: {e}"))?;
+            // 消费响应体后继续，避免连接复用被破坏
+            let _ = resp.text().await;
+            continue;
+        }
+        break resp;
+    };
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("网页返回错误状态码: {status}"));
@@ -417,7 +830,7 @@ pub async fn fetch_webpage(
     let mut out = String::from(
         "<!doctype html><html><head><meta charset=\"utf-8\"><base href=\"",
     );
-    out.push_str(&escape_attr(&url));
+    out.push_str(&escape_attr(&current));
     out.push_str(
         "\"><style>img{max-width:100%;height:auto}table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #ccc;padding:5px 8px;text-align:left}body{font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;margin:0;padding:14px;line-height:1.7;font-size:14px;color:#1c2027;word-break:break-word}a{color:#4d6bfe;text-decoration:none}pre{background:#f5f6f8;padding:10px;border-radius:6px;overflow-x:auto}code{background:#f5f6f8;border-radius:4px;padding:1px 5px}</style></head><body>",
     );
@@ -426,7 +839,7 @@ pub async fn fetch_webpage(
     if out.len() < 250 {
         return Err("未能提取到网页正文内容".into());
     }
-    Ok(WebPage { url, title, html: out })
+    Ok(WebPage { url: current, title, html: out })
 }
 
 /// 白名单序列化：只保留安全标签与属性，转义文本，剔除脚本/表单等危险内容

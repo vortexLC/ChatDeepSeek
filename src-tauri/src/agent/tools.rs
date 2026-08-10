@@ -60,9 +60,8 @@ pub async fn execute_tool(
     settings: &crate::models::AppSettings,
     token: &CancelToken,
 ) -> Result<ToolOutcome, String> {
-    match name {
-        TOOL_WEB_SEARCH => {
-            let outcome = crate::llm::search::execute_search(
+    let outcome = match name {
+        TOOL_WEB_SEARCH => {            let outcome = crate::llm::search::execute_search(
                 app, state, conv_id, arguments, &settings.search, token,
             )
             .await?;
@@ -108,18 +107,46 @@ pub async fn execute_tool(
         }
         TOOL_GENERATE_IMAGE => {
             let (content, artifacts) =
-                crate::agent::generate::generate_image(app, state, &settings.gen, conv_id, arguments).await?;
+                crate::agent::generate::generate_image(app, state, settings, conv_id, arguments).await?;
             Ok(ToolOutcome { content, artifacts })
         }
         TOOL_GENERATE_VIDEO => {
+            // 图生视频：若模型未提供 image，自动使用用户最近上传的图片
+            let mut args: serde_json::Value =
+                serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+            let has_image = args
+                .get("image")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if !has_image {
+                if let Some(data_url) = crate::commands::latest_user_image_data_url(state, conv_id)
+                {
+                    if args.is_null() {
+                        args = serde_json::json!({});
+                    }
+                    args["image"] = serde_json::json!(data_url);
+                }
+            }
+            let final_args = serde_json::to_string(&args)
+                .unwrap_or_else(|_| arguments.to_string());
             let (content, artifacts) = crate::agent::generate::generate_video(
-                app, state, &settings.gen, conv_id, arguments,
+                app, state, settings, conv_id, &final_args,
             )
             .await?;
             Ok(ToolOutcome { content, artifacts })
         }
         _ => Err(format!("未知工具: {name}")),
+    };
+    // 统一截断超长工具输出，保护上下文容量
+    let mut outcome = outcome?;
+    const MAX_TOOL_OUTPUT: usize = 6000;
+    if outcome.content.chars().count() > MAX_TOOL_OUTPUT {
+        let truncated: String = outcome.content.chars().take(MAX_TOOL_OUTPUT).collect();
+        let total = outcome.content.chars().count();
+        outcome.content = format!("{truncated}\n\n[输出过长，已截断（共 {total} 字符，仅保留前 {MAX_TOOL_OUTPUT} 字符）]");
     }
+    Ok(outcome)
 }
 
 // ==================== 文件工具 ====================
@@ -597,11 +624,17 @@ fn generate_image_tool() -> serde_json::Value {
 fn generate_video_tool() -> serde_json::Value {
     tool_def(
         TOOL_GENERATE_VIDEO,
-        "根据文字描述生成一段短视频（AI 视频生成）。可选传入图片 URL 进行图生视频。生成耗时约几分钟，完成后自动保存到会话 videos 目录。",
+        "根据文字描述生成一段短视频（AI 视频生成），生成耗时约几分钟，完成后自动保存到会话 videos 目录。\n\
+         三种用法（通过 mode 明确指定）：\n\
+         1. 文生视频 text2video：只用 prompt 文字描述即可；\n\
+         2. 图生视频 image2video：以用户上传的图片（系统会自动获取，无需传 image）或 image 参数（URL / data:image base64）作为起始画面；\n\
+         3. 参考图生视频 reference2video：以 images 参数中的一张或多张参考图生成视频（需参考生视频 r2v 模型）。\n\
+         用户明确要求基于某张图/把图片做成视频时，优先使用图生视频 image2video。",
         json!({
+            "mode": {"type": "string", "enum": ["text2video", "image2video", "reference2video"], "description": "可选：文生视频 / 图生视频 / 参考图生视频；缺省时系统按是否提供图片自动判断"},
             "prompt": {"type": "string", "description": "视频内容描述（画面、动作、镜头运动等）"},
-            "image": {"type": "string", "description": "可选：图生视频的起始图片 URL 或 data:image base64"},
-            "model": {"type": "string", "enum": ["Wan-AI/Wan2.2-T2V-A14B", "Wan-AI/Wan2.2-I2V-A14B"], "description": "模型：T2V 文生视频 / I2V 图生视频，默认按是否传 image 自动选择"},
+            "image": {"type": "string", "description": "可选：图生视频的起始图片 URL 或 data:image base64（留空则自动使用用户最近上传的图片）"},
+            "images": {"type": "array", "items": {"type": "string"}, "description": "可选：参考图生视频的参考图片列表（URL / base64）"},
             "image_size": {"type": "string", "enum": ["1280x720", "720x1280", "960x960"], "description": "视频画幅，默认 1280x720"}
         }),
         vec!["prompt"],

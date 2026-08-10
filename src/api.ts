@@ -7,14 +7,17 @@ import type {
   ContextStatus,
   Conversation,
   Effort,
+  Job,
   Message,
-  Provider,
+  ModelConfig,
+  ProviderConfig,
+  UploadAttachment,
   WebPage,
 } from "./types";
 
 export interface ConversationUpdate {
   title?: string;
-  provider?: Provider;
+  provider?: string;
   model?: string;
   web_search?: boolean;
   deep_think?: boolean;
@@ -52,6 +55,10 @@ export async function getMessages(id: number): Promise<Message[]> {
   return invoke("get_messages", { id });
 }
 
+export async function listJobs(conversationId: number): Promise<Job[]> {
+  return invoke("list_jobs", { conversationId });
+}
+
 export async function getContextStatus(id: number): Promise<ContextStatus> {
   return invoke("get_context_status", { conversationId: id });
 }
@@ -70,17 +77,24 @@ export async function clearAllConversations(): Promise<void> {
 
 export async function sendMessage(
   conversationId: number,
-  content: string
+  content: string,
+  attachments: UploadAttachment[] = []
 ): Promise<void> {
-  return invoke("send_message", { conversationId, content });
+  return invoke("send_message", { conversationId, content, attachments });
 }
 
 export async function editAndResend(
   conversationId: number,
   messageId: number,
-  content: string
+  content: string,
+  attachments: UploadAttachment[] = []
 ): Promise<void> {
-  return invoke("edit_and_resend", { conversationId, messageId, content });
+  return invoke("edit_and_resend", {
+    conversationId,
+    messageId,
+    content,
+    attachments,
+  });
 }
 
 export async function fetchWebPage(url: string): Promise<WebPage> {
@@ -112,8 +126,11 @@ export async function stopGeneration(conversationId: number): Promise<void> {
   return invoke("stop_generation", { conversationId });
 }
 
-export async function testDeepSeekConnection(apiKey: string): Promise<string> {
-  return invoke("test_deepseek_connection", { apiKey });
+export async function testModel(
+  provider: ProviderConfig,
+  model: ModelConfig
+): Promise<string> {
+  return invoke("test_model", { provider, model });
 }
 
 export function onChatEvent(

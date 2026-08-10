@@ -5,15 +5,57 @@ export type SearchStrategy = "auto" | "tavily" | "anysearch";
 
 export type AgentMode = "chat" | "image" | "video" | "build" | "agent";
 
+export type ModelType = "text" | "vision" | "image" | "video";
+export type VideoApi = "auto" | "siliconflow" | "dashscope";
+
+export interface ModelConfig {
+  id: string;
+  name: string;
+  model_type: ModelType;
+  video_api: VideoApi;
+  context_tokens: number;
+}
+
+export interface ProviderConfig {
+  id: string;
+  name: string;
+  protocol: "openai" | "anthropic";
+  api_base: string;
+  api_key: string;
+  models: ModelConfig[];
+}
+
+export interface ModelSelection {
+  provider_id: string;
+  model_id: string;
+}
+
+export interface Attachment {
+  name: string;
+  mime: string;
+  kind: "image" | "document";
+  path: string;
+  size: number;
+}
+
+export interface UploadAttachment {
+  name: string;
+  mime: string;
+  data_url: string;
+  kind: "image" | "document";
+}
+
 export interface Conversation {
   id: number;
   title: string;
-  provider: Provider;
+  provider: string;
   model: string;
   web_search: boolean;
   deep_think: boolean;
   effort: Effort;
   mode: AgentMode;
+  summary?: string;
+  summarized_until?: number;
   created_at: number;
   updated_at: number;
 }
@@ -33,6 +75,21 @@ export interface Artifact {
   note: string;
 }
 
+/** 异步生成任务（如视频）：提交后展示"生成中"，完成后展示结果 */
+export interface Job {
+  id: number;
+  conversation_id: number;
+  kind: "video" | "image";
+  api: string;
+  model: string;
+  request_id: string;
+  status: "pending" | "done" | "failed" | "canceled";
+  submitted_at: number;
+  finished_at: number;
+  error: string;
+  artifact: Artifact | null;
+}
+
 export interface Message {
   id: number;
   conversation_id: number;
@@ -41,6 +98,8 @@ export interface Message {
   reasoning: string;
   search_results: SearchItem[];
   artifacts: Artifact[];
+  attachments: Attachment[];
+  job_id?: number | null;
   created_at: number;
 }
 
@@ -65,9 +124,18 @@ export interface SiliconFlowGenSettings {
   video_model_t2v: string;
 }
 
+export interface AlibabaGenSettings {
+  api_key: string;
+  base_url: string;
+  image_model: string;
+  video_model_i2v: string;
+  video_model_t2v: string;
+}
+
 export interface GenSettings {
   provider: string;
   siliconflow: SiliconFlowGenSettings;
+  alibaba: AlibabaGenSettings;
 }
 
 export interface AppSettings {
@@ -80,6 +148,12 @@ export interface AppSettings {
   deepseek: DeepSeekSettings;
   search: SearchSettings;
   gen: GenSettings;
+  providers: ProviderConfig[];
+  chat_model: ModelSelection | null;
+  image_model: ModelSelection | null;
+  video_model_t2v: ModelSelection | null;
+  video_model_i2v: ModelSelection | null;
+  video_model_r2v: ModelSelection | null;
 }
 
 export type ChatStatus =
@@ -108,7 +182,11 @@ export interface ChatEventPayload {
     | "search_result"
     | "artifact"
     | "permission_request"
+    | "video_submitted"
     | "video_done"
+    | "video_failed"
+    | "job_canceled"
+    | "stopped"
     | "done"
     | "error";
   conversation_id: number;
@@ -118,6 +196,7 @@ export interface ChatEventPayload {
   tool?: string;
   path?: string;
   search_provider?: "tavily" | "anysearch" | null;
+  job?: Job;
 }
 
 export interface PermissionRequest {
@@ -129,7 +208,8 @@ export interface PermissionRequest {
 export interface ModelOption {
   label: string;
   model: string;
-  family: "flash" | "pro";
+  modelType: ModelType;
+  protocol: Provider;
 }
 
 export interface ContextStatus {
@@ -138,6 +218,7 @@ export interface ContextStatus {
   percent: number;
   near_full: boolean;
   full: boolean;
+  compressed: boolean;
 }
 
 export interface WebPage {

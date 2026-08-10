@@ -25,7 +25,7 @@
       "devCsp": "default-src 'self' http://localhost:1420; script-src 'self' http://localhost:1420 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http: asset:; media-src 'self' data: https: http: asset:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420 asset:; object-src 'none'; base-uri 'self'; form-action 'none'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": ["**/data/**", "$APPDATA/**/data/**"]
       }
     }
   },

@@ -67,6 +67,7 @@ export function WebPreviewPanel({
           <iframe
             className="web-panel-frame"
             sandbox=""
+            referrerPolicy="no-referrer"
             srcDoc={preview.html}
             title={preview.title}
           />

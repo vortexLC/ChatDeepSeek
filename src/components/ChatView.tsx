@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentMode,
   Artifact,
@@ -7,22 +7,24 @@ import type {
   Conversation,
   EditTarget,
   Effort,
+  Job,
   Message,
   ModelOption,
+  UploadAttachment,
 } from "../types";
 import { MessageItem } from "./MessageItem";
 import { InputBar } from "./InputBar";
 import { Markdown } from "./Markdown";
+import { ArtifactCards } from "./ArtifactCards";
+import { JobCards } from "./JobCard";
 import { renderMarkdown } from "../lib/markdown";
 import {
   AlertIcon,
   ChevronDownIcon,
   GlobeIcon,
-  ImageIcon,
   LinkIcon,
   SearchIcon,
   SparkIcon,
-  VideoIcon,
   XIcon,
 } from "./icons";
 
@@ -40,56 +42,11 @@ const SUGGESTIONS = [
   "推荐 3 个适合新手的编程项目",
 ];
 
-function effortOptionsForFamily(family: string): Effort[] {
-  if (family === "pro") return ["high", "max"];
-  return ["low", "high", "max"];
-}
-
-function ArtifactCards({
-  artifacts,
-  onOpenArtifact,
-  onOpenFile,
-  convId,
-}: {
-  artifacts: Artifact[];
-  onOpenArtifact: (convId: number, artifact: Artifact) => void;
-  onOpenFile: (convId: number, path: string, title: string) => void;
-  convId: number;
-}) {
-  if (!artifacts || artifacts.length === 0) return null;
-  return (
-    <div className="artifact-list">
-      {artifacts.map((a, i) => (
-        <button
-          key={`${a.path}-${i}`}
-          className={`artifact-card ${a.kind}`}
-          onClick={() =>
-            a.kind === "file"
-              ? onOpenFile(convId, a.path, a.name)
-              : onOpenArtifact(convId, a)
-          }
-          title={a.path}
-        >
-          {a.kind === "image" ? (
-            <ImageIcon size={15} />
-          ) : a.kind === "video" ? (
-            <VideoIcon size={15} />
-          ) : (
-            <LinkIcon size={13} />
-          )}
-          <span className="artifact-name">{a.name}</span>
-          <span className="artifact-note">
-            {a.kind === "image"
-              ? "图片"
-              : a.kind === "video"
-                ? "视频"
-                : "文件"}
-            {a.size > 0 ? ` · ${(a.size / 1024).toFixed(0)} KB` : ""}
-          </span>
-        </button>
-      ))}
-    </div>
-  );
+function effortOptionsForProtocol(protocol?: string): Effort[] {
+  // 仅 Anthropic 协议会携带推理强度（output_config.effort）；
+  // OpenAI 兼容协议不传该参数，返回空数组以隐藏强度选择
+  if (protocol === "anthropic") return ["low", "high", "max"];
+  return [];
 }
 
 function DraftMessage({
@@ -106,8 +63,13 @@ function DraftMessage({
   convId: number;
 }) {
   const [showReasoning, setShowReasoning] = useState(false);
-  // 流式渲染节流：高优先级渲染走低优先级延迟值，避免每次 token 全量重渲染长 Markdown
+  // 流式渲染节流：高优先级渲染走低优先级延迟值，避免每次 token 全量重渲染长 Markdown；
+  // 渲染结果按延迟值缓存，未变化期间不重复解析
   const deferredContent = useDeferredValue(draft.content);
+  const contentHtml = useMemo(
+    () => renderMarkdown(deferredContent) + `<span class="cursor">▍</span>`,
+    [deferredContent]
+  );
 
   useEffect(() => {
     if (draft.reasoning) setShowReasoning(true);
@@ -157,12 +119,25 @@ function DraftMessage({
       <div className="msg-avatar">DS</div>
       <div className="msg-body">
         {statusChip}
-        <ArtifactCards
-          artifacts={draft.artifacts}
-          onOpenArtifact={onOpenArtifact}
-          onOpenFile={onOpenFile}
-          convId={convId}
-        />
+        {draft.reasoning && showReasoning && (
+          <div className="thinking-block open">
+            <button
+              className="thinking-toggle"
+              onClick={() => setShowReasoning((v) => !v)}
+            >
+              <ChevronDownIcon size={13} />
+              <span>思考过程</span>
+            </button>
+            <div className="thinking-content">{draft.reasoning}</div>
+          </div>
+        )}
+        {deferredContent && (
+          <Markdown
+            className="markdown-body streaming"
+            html={contentHtml}
+            onOpenLink={onOpenLink}
+          />
+        )}
         {draft.searchItems.length > 0 && (
           <div className="search-cards">
             <div className="search-cards-label">
@@ -184,26 +159,12 @@ function DraftMessage({
             </div>
           </div>
         )}
-        {draft.reasoning && showReasoning && (
-          <div className="thinking-block open">
-            <button
-              className="thinking-toggle"
-              onClick={() => setShowReasoning((v) => !v)}
-            >
-              <ChevronDownIcon size={13} />
-              <span>深度思考过程</span>
-            </button>
-            <div className="thinking-content">{draft.reasoning}</div>
-          </div>
-        )}
-        {deferredContent && (
-          <Markdown
-            className="markdown-body streaming"
-            html={renderMarkdown(deferredContent) + `<span class="cursor">▍</span>`}
-            onOpenLink={onOpenLink}
-          />
-        )}
-        {draft.error && <div className="draft-error">{draft.error}</div>}
+        <ArtifactCards
+          artifacts={draft.artifacts}
+          onOpenArtifact={onOpenArtifact}
+          onOpenFile={onOpenFile}
+          convId={convId}
+        />
       </div>
     </div>
   );
@@ -214,11 +175,13 @@ interface ChatViewProps {
   messages: Message[];
   loadingMessages: boolean;
   draft: ChatDraft | null;
+  jobs: Job[];
   context: ContextStatus | null;
   onNewConversation: () => void;
   previewOpen: boolean;
   onTogglePreview: () => void;
   modelOptions: ModelOption[];
+  defaultModel: string;
   onSelectModel: (option: ModelOption) => void;
   onToggleWebSearch: () => void;
   onToggleDeepThink: () => void;
@@ -226,8 +189,8 @@ interface ChatViewProps {
   onSetMode: (mode: AgentMode) => void;
   editTarget: EditTarget | null;
   onCancelEdit: () => void;
-  onSend: (content: string) => void;
-  onSendEdit: (content: string) => void;
+  onSend: (content: string, attachments: UploadAttachment[]) => Promise<boolean>;
+  onSendEdit: (content: string, attachments: UploadAttachment[]) => Promise<boolean>;
   onStop: () => void;
   onOpenLink: (url: string) => void;
   onOpenFile: (convId: number, path: string, title: string) => void;
@@ -240,11 +203,13 @@ export function ChatView({
   messages,
   loadingMessages,
   draft,
+  jobs,
   context,
   onNewConversation,
   previewOpen,
   onTogglePreview,
   modelOptions,
+  defaultModel,
   onSelectModel,
   onToggleWebSearch,
   onToggleDeepThink,
@@ -261,15 +226,21 @@ export function ChatView({
   onEditMessage,
 }: ChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const endRef = useRef<HTMLDivElement>(null);
   const [contextDismissed, setContextDismissed] = useState(false);
 
   useEffect(() => {
     setContextDismissed(false);
   }, [conversation?.id]);
 
+  // 内容增长时：仅当用户处于底部附近才跟随滚动到底部；
+  // 用户上翻阅读历史/思考过程时完全不干预，保证可以自由滚动查看
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (atBottom) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [
     messages,
     draft?.reasoning,
@@ -277,6 +248,7 @@ export function ChatView({
     draft?.status,
     draft?.searchItems,
     draft?.artifacts,
+    jobs.length,
   ]);
 
   if (!conversation) {
@@ -294,6 +266,12 @@ export function ChatView({
   }
 
   const streaming = !!draft;
+
+  // 有效对话模型：会话内已选且仍有效的模型优先，否则回退到默认模型，
+  // 使发送框显示的模型与设置 → 模型选择 保持一致
+  const effectiveModel = modelOptions.some((o) => o.model === conversation.model)
+    ? conversation.model
+    : defaultModel;
 
   return (
     <div className="chat-view">
@@ -333,7 +311,7 @@ export function ChatView({
                 <button
                   key={s}
                   className="suggestion-chip"
-                  onClick={() => onSend(s)}
+                  onClick={() => onSend(s, [])}
                   disabled={!!draft}
                 >
                   {s}
@@ -346,6 +324,7 @@ export function ChatView({
           <MessageItem
             key={m.id}
             message={m}
+            jobs={jobs}
             onOpenLink={onOpenLink}
             onOpenFile={onOpenFile}
             onOpenArtifact={onOpenArtifact}
@@ -361,7 +340,7 @@ export function ChatView({
             convId={conversation.id}
           />
         )}
-        <div ref={endRef} />
+        <JobCards jobs={jobs} />
       </div>
 
       {context && !contextDismissed && (context.full || context.near_full) && (
@@ -369,8 +348,8 @@ export function ChatView({
           <AlertIcon size={15} />
           <span className="context-bar-text">
             {context.full
-              ? `当前会话上下文已满（${formatTokens(context.used_tokens)} / ${formatTokens(context.total_tokens)}），无法继续发送消息，请开启新对话`
-              : `当前会话上下文已使用 ${Math.round(context.percent * 100)}%（${formatTokens(context.used_tokens)} / ${formatTokens(context.total_tokens)}），建议开启新对话`}
+              ? `当前会话上下文已满（${formatTokens(context.used_tokens)} / ${formatTokens(context.total_tokens)}）${context.compressed ? "，已自动压缩但仍接近上限" : ""}，无法继续发送消息，请开启新对话`
+              : `当前会话上下文已使用 ${Math.round(context.percent * 100)}%（${formatTokens(context.used_tokens)} / ${formatTokens(context.total_tokens)}）${context.compressed ? "，已自动压缩早期对话" : ""}，建议开启新对话`}
           </span>
           <button className="context-bar-action" onClick={onNewConversation}>
             开启新对话
@@ -384,8 +363,15 @@ export function ChatView({
           </button>
         </div>
       )}
+      {context?.compressed && (
+        <div className="context-compressed-chip" title="早期对话已自动摘要，不再占用完整上下文">
+          <SparkIcon size={11} />
+          已自动压缩早期对话
+        </div>
+      )}
 
       <InputBar
+        resetKey={conversation.id}
         disabled={false}
         contextFull={context?.full ?? false}
         streaming={streaming}
@@ -394,17 +380,13 @@ export function ChatView({
         mode={conversation.mode}
         onSetMode={onSetMode}
         modelOptions={modelOptions}
-        currentModel={conversation.model}
+        currentModel={effectiveModel}
         onSelectModel={onSelectModel}
         webSearch={conversation.web_search}
         deepThink={conversation.deep_think}
         effort={conversation.effort}
-        effortOptions={effortOptionsForFamily(
-          conversation.model.includes("flash")
-            ? "flash"
-            : conversation.model.includes("pro")
-              ? "pro"
-              : "flash"
+        effortOptions={effortOptionsForProtocol(
+          modelOptions.find((o) => o.model === effectiveModel)?.protocol
         )}
         onToggleWebSearch={onToggleWebSearch}
         onToggleDeepThink={onToggleDeepThink}

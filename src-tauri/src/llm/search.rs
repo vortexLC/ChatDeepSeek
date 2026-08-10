@@ -139,6 +139,7 @@ async fn tavily_search(
     let resp = state
         .client
         .post(TAVILY_ENDPOINT)
+        .timeout(std::time::Duration::from_secs(20))
         .json(&body)
         .send()
         .await
@@ -199,6 +200,7 @@ async fn anysearch_search(
         req = req.bearer_auth(api_key);
     }
     let resp = req
+        .timeout(std::time::Duration::from_secs(25))
         .json(&body)
         .send()
         .await
