@@ -176,11 +176,12 @@ pub(crate) fn build_system_prompt(conv: &Conversation) -> String {
 【重要】\n\
 - 你确实具备图片与视频生成能力（由上述工具调用专门模型实现）。严禁回复「我无法生成图片/视频」「作为文本/语言模型我不能…」「你可以把提示词复制到 Midjourney / Stable Diffusion / Runway / 可灵等工具中」之类的话术。\n\
 - 需要生成时，立即实际发起对应工具调用。严禁只在回复正文里描述或罗列「调用 generate_image：prompt: …」这类文字而不真正调用工具；也严禁只说「正在为您生成」却不发起调用。调用工具前不要输出冗长的计划、分镜脚本或提示词设计。\n\
+- 若你的实现确实无法发起函数调用，请直接输出 JSON 形式的工具参数（generate_image 如 {\"prompt\": \"...\"}；generate_video 如 {\"mode\": \"text2video\", \"prompt\": \"...\"}），系统会自动识别并执行。\n\
 - 用户要求「先生成图片、再基于该图生成视频」时：先调用 generate_image，等拿到图片结果（含 images/xxx.png 路径）后，再调用 generate_video（mode=image2video，image 传刚生成的图片路径 images/xxx.png）。",
         MODE_IMAGE => "\n\n【当前模式：Image】你具备图片生成能力：当用户要求生成、绘制、设计任何图片/图像/插画/海报/壁纸等视觉内容时，必须调用 generate_image 工具——系统会调用专门的绘图模型完成生成并自动保存。\n\
-【重要】严禁回复「我无法生成图片」「作为文本模型我不能画图」「请去 Midjourney / Stable Diffusion 等外部工具」等话术，也不要只输出提示词。需要生成时立即实际发起 generate_image 工具调用，不要在正文里描述「调用 generate_image：…」而不真正调用。",
+【重要】严禁回复「我无法生成图片」「作为文本模型我不能画图」「请去 Midjourney / Stable Diffusion 等外部工具」等话术，也不要只输出提示词。需要生成时立即实际发起 generate_image 工具调用，不要在正文里描述「调用 generate_image：…」而不真正调用。若你的实现确实无法发起函数调用，请直接输出 JSON 形式的参数（如 {\"prompt\": \"...\"}），系统会自动识别并执行。",
         MODE_VIDEO => "\n\n【当前模式：Video】你具备视频生成能力：当用户要求生成视频/动画/短片时，必须调用 generate_video 工具，并按需选择 mode：text2video 文生视频（无需图片）；image2video 图生视频（图片作首帧）；reference2video 参考图生视频（参考图片风格/主体，需 r2v 模型）。image/images 可传图片 URL、base64 或本会话内图片路径（如 images/xxx.png，即 generate_image 的产物）；图生/参考模式下若用户已上传图片也可不传 image，系统自动使用最近上传的图片。生成需几分钟，请告知用户耐心等待。\n\
-【重要】严禁回复「我无法生成视频」等话术，也不要只给提示词。需要生成时立即实际发起 generate_video 工具调用，不要在正文里描述「调用 generate_video：…」而不真正调用。",
+【重要】严禁回复「我无法生成视频」等话术，也不要只给提示词。需要生成时立即实际发起 generate_video 工具调用，不要在正文里描述「调用 generate_video：…」而不真正调用。若你的实现确实无法发起函数调用，请直接输出 JSON 形式的参数（如 {\"mode\": \"text2video\", \"prompt\": \"...\"}），系统会自动识别并执行。",
         _ => "",
     };
     let base = if conv.web_search {
@@ -492,29 +493,45 @@ async fn run_agent_inner(
         }
 
         if turn.tool_calls.is_empty() {
+            // 兜底：部分模型/API 不支持 function calling，会把工具参数以文本 JSON
+            // 形式输出（如 {"prompt": "..."}）。识别并代为执行，避免"只给提示词不生成"
+            if let Some((tool_name, args)) = parse_textual_tool_call(&turn.content, &conv.mode) {
+                if tools.iter().any(|t| t["name"].as_str() == Some(tool_name.as_str())) {
+                    let id = format!("text_call_{}", crate::db::now_ms());
+                    let calls = vec![ToolCall {
+                        id: id.clone(),
+                        name: tool_name,
+                        arguments: args.to_string(),
+                    }];
+                    let results =
+                        execute_tool_calls(app, state_arc, conv.id, &calls, settings, token, acc)
+                            .await?;
+                    // 按 API 要求顺序拼接上下文：assistant(tool_use) 在前，user(tool_result) 紧跟
+                    cur.push(OutMsg::Assistant {
+                        content: turn.content,
+                        tool_calls: calls,
+                    });
+                    for tr in results {
+                        cur.push(OutMsg::Tool {
+                            tool_call_id: tr.tool_call_id,
+                            content: tr.content,
+                        });
+                    }
+                    continue;
+                }
+            }
             break;
         }
 
-        let mut results: Vec<ToolResult> = Vec::new();
-        for tc in &turn.tool_calls {
-            if token.is_cancelled() {
-                return Err("已停止生成".into());
-            }
-            let outcome = tools::execute_tool(app, state_arc, conv.id, &tc.name, &tc.arguments, settings, token).await?;
-            // 产物实时推送到前端
-            for art in &outcome.artifacts {
-                emit_artifact(app, conv.id, art);
-            }
-            acc.artifacts.extend(outcome.artifacts.clone());
-            let tr = ToolResult {
-                tool_call_id: tc.id.clone(),
-                content: outcome.content,
-            };
-            // 工具调用与其结果成对保存，保证中断/出错时持久化的数据也能正确回放
-            acc.tool_calls.push(tc.clone());
-            acc.tool_results.push(tr.clone());
-            results.push(tr);
+        // 防御：未提供联网搜索工具时，忽略模型误发的 web_search 调用
+        if !conv.web_search {
+            turn.tool_calls.retain(|tc| tc.name != tools::TOOL_WEB_SEARCH);
         }
+        if turn.tool_calls.is_empty() {
+            break;
+        }
+
+        let results = execute_tool_calls(app, state_arc, conv.id, &turn.tool_calls, settings, token, acc).await?;
 
         // 按 API 要求顺序拼接上下文：assistant(tool_use) 在前，user(tool_result) 紧跟其后
         cur.push(OutMsg::Assistant {
@@ -530,6 +547,74 @@ async fn run_agent_inner(
     }
 
     Ok(())
+}
+
+/// 执行一组工具调用：逐个执行、推送产物、累计到 acc，返回按顺序的 ToolResult
+async fn execute_tool_calls(
+    app: &AppHandle,
+    state_arc: &Arc<AppState>,
+    conv_id: i64,
+    tool_calls: &[ToolCall],
+    settings: &AppSettings,
+    token: &CancelToken,
+    acc: &mut Accum,
+) -> Result<Vec<ToolResult>, String> {
+    let mut results: Vec<ToolResult> = Vec::new();
+    for tc in tool_calls {
+        if token.is_cancelled() {
+            return Err("已停止生成".into());
+        }
+        let outcome =
+            tools::execute_tool(app, state_arc, conv_id, &tc.name, &tc.arguments, settings, token)
+                .await?;
+        // 产物实时推送到前端
+        for art in &outcome.artifacts {
+            emit_artifact(app, conv_id, art);
+        }
+        acc.artifacts.extend(outcome.artifacts.clone());
+        let tr = ToolResult {
+            tool_call_id: tc.id.clone(),
+            content: outcome.content,
+        };
+        // 工具调用与其结果成对保存，保证中断/出错时持久化的数据也能正确回放
+        acc.tool_calls.push(tc.clone());
+        acc.tool_results.push(tr.clone());
+        results.push(tr);
+    }
+    Ok(results)
+}
+
+/// 从模型文本回复中识别"文本形式的工具调用"（兼容不支持 function calling 的模型）。
+/// 仅当内容整体是合法 JSON 对象且含 prompt 字段时返回 (工具名, 参数 JSON)。
+/// - 含 mode/image/images 字段或当前为 Video 模式 → generate_video
+/// - 否则 Image / Agent 模式 → generate_image
+/// 避免误判：非 JSON、无 prompt、或非生成模式一律返回 None
+fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_json::Value)> {
+    let trimmed = content.trim();
+    // 允许 ```json ... ``` 代码块包裹
+    let json_str = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|s| s.strip_suffix("```").unwrap_or(s))
+        .map(|s| s.trim())
+        .unwrap_or(trimmed);
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let obj = v.as_object()?;
+    let prompt = obj.get("prompt").and_then(|p| p.as_str())?;
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    let video_hint = obj.contains_key("mode")
+        || obj.contains_key("image")
+        || obj.contains_key("images")
+        || mode == MODE_VIDEO;
+    if video_hint {
+        Some((tools::TOOL_GENERATE_VIDEO.to_string(), v))
+    } else if mode == MODE_IMAGE || mode == MODE_AGENT {
+        Some((tools::TOOL_GENERATE_IMAGE.to_string(), v))
+    } else {
+        None
+    }
 }
 
 fn emit_artifact(app: &AppHandle, conv_id: i64, artifact: &Artifact) {
@@ -661,4 +746,37 @@ async fn try_compress_history(
         .db
         .update_conversation_summary(conv.id, &summary, cutoff_id - 1);
     Some((summary, cutoff_id - 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 文本形式工具调用解析：JSON/代码块/视频字段/模式约束
+    #[test]
+    fn textual_tool_call_parsing() {
+        // 纯 JSON → generate_image（Image 模式）
+        let r = parse_textual_tool_call(r#"{"prompt": "一只猫"}"#, MODE_IMAGE);
+        assert!(r.is_some());
+        let (name, args) = r.unwrap();
+        assert_eq!(name, tools::TOOL_GENERATE_IMAGE);
+        assert_eq!(args["prompt"], "一只猫");
+
+        // 代码块包裹同样识别
+        let r = parse_textual_tool_call("```json\n{\"prompt\": \"狗\"}\n```", MODE_IMAGE);
+        assert!(r.is_some());
+
+        // 含 mode 字段 → generate_video
+        let r = parse_textual_tool_call(r#"{"mode": "text2video", "prompt": "视频"}"#, MODE_IMAGE);
+        assert_eq!(r.unwrap().0, tools::TOOL_GENERATE_VIDEO);
+
+        // Video 模式缺省 → generate_video
+        let r = parse_textual_tool_call(r#"{"prompt": "视频"}"#, MODE_VIDEO);
+        assert_eq!(r.unwrap().0, tools::TOOL_GENERATE_VIDEO);
+
+        // 普通文本 / 无 prompt / Chat 模式 → 不识别
+        assert!(parse_textual_tool_call("你好，有什么可以帮你", MODE_IMAGE).is_none());
+        assert!(parse_textual_tool_call(r#"{"a": 1}"#, MODE_IMAGE).is_none());
+        assert!(parse_textual_tool_call(r#"{"prompt": "x"}"#, MODE_CHAT).is_none());
+    }
 }
