@@ -197,6 +197,9 @@ pub fn cancel_session_tasks(state: &AppState, conv_id: i64) {
         }
     }
     drop(tasks);
+    // 丢弃等待用户确认的越界访问请求：会话已删除/编辑，确认已无意义。
+    // 丢弃 oneshot sender 后等待方立即收到"确认已失效"，agent 任务得以尽快结束
+    state.pending_perms.lock().unwrap().remove(&conv_id);
     // 数据库中的未完成任务同步标记为已取消
     let _ = state.db.cancel_jobs_for_session(conv_id);
 }
@@ -209,6 +212,8 @@ pub fn cancel_all_tasks(state: &AppState) {
     for t in state.bg_tasks.lock().unwrap().values() {
         t.cancel();
     }
+    // 清空所有待确认的越界访问请求（应用退出，确认无意义）
+    state.pending_perms.lock().unwrap().clear();
 }
 
 /// 请求用户确认越界访问（会话目录之外的文件操作），90 秒超时自动拒绝

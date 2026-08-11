@@ -8,8 +8,13 @@
 //!    的一切路径（C:\Users\...、messages.db 等）默认被系统拒绝，无论命令怎么写
 //!
 //! 安全策略：沙箱初始化失败时拒绝执行（fail-closed），绝不静默降级。
+//!
+//! 非 Windows 平台无 AppContainer 可用：退化为普通子进程执行（无系统级隔离，
+//! 但仍保留调用前的权限确认与 60 秒超时）。
 
-use std::os::windows::ffi::OsStrExt;
+#[cfg(target_os = "windows")]
+mod imp {
+    use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 
@@ -308,6 +313,48 @@ impl ContainerSandbox {
         }
     }
 }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod imp {
+    use std::path::Path;
+    use std::process::Command;
+
+    /// 非 Windows 平台：无 AppContainer 可用，退化为普通子进程执行。
+    /// 调用前的权限确认与 60 秒超时仍在 tools.rs 层生效，但无操作系统级隔离。
+    pub struct ContainerSandbox {
+        _session_id: i64,
+    }
+
+    impl ContainerSandbox {
+        pub fn for_session(session_id: i64) -> Result<Self, String> {
+            Ok(ContainerSandbox {
+                _session_id: session_id,
+            })
+        }
+
+        pub fn grant_access(&self, _dir: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        /// 以系统 shell 执行命令（阻塞），返回 (stdout, stderr, 退出码)
+        pub fn run(&self, cwd: &Path, command: &str) -> Result<(Vec<u8>, Vec<u8>, i32), String> {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(cwd)
+                .output()
+                .map_err(|e| format!("执行命令失败: {e}"))?;
+            Ok((
+                output.stdout,
+                output.stderr,
+                output.status.code().unwrap_or(-1),
+            ))
+        }
+    }
+}
+
+pub use imp::ContainerSandbox;
 
 /// 工具函数：把输出格式化为返回文本（含退出码）
 pub fn format_output(stdout: &[u8], stderr: &[u8], code: i32) -> String {

@@ -644,6 +644,7 @@ async fn submit_dashscope_video(
             .post(url)
             .bearer_auth(api_key)
             .header("X-DashScope-Async", "enable")
+            .timeout(std::time::Duration::from_secs(30))
             .json(b)
     };
     let resp = send(body)

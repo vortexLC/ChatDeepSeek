@@ -21,14 +21,26 @@ pub async fn run(
     let url = format!("{base}/v1/messages");
 
     let body = build_body(model, conv, msgs, tools, true);
-    let mut resp = send_request(state, &url, &provider.api_key, &body).await?;
+    // 初始请求（建立流式连接）加超时：服务端挂起时避免任务永久卡死、
+    // 停止按钮失效（此时还未进入可取消的流式循环）
+    let mut resp = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        send_request(state, &url, &provider.api_key, &body),
+    )
+    .await
+    .map_err(|_| "请求超时（60 秒），请检查网络或服务商状态".to_string())??;
 
     if resp.status() == 400 {
         // 极少数兼容服务不接受思考模式参数，收到 400 时去掉思考参数重试一次
         // （先消费响应体再重试，避免连接复用被破坏）
         let _ = resp.text().await;
         let body2 = build_body(model, conv, msgs, tools, false);
-        resp = send_request(state, &url, &provider.api_key, &body2).await?;
+        resp = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            send_request(state, &url, &provider.api_key, &body2),
+        )
+        .await
+        .map_err(|_| "请求超时（60 秒），请检查网络或服务商状态".to_string())??;
     }
 
     let status = resp.status();
@@ -57,10 +69,15 @@ pub async fn run(
                     error: None,
                 });
             }
-            chunk = stream.next() => {
+            // 流式读取停滞超时：网络静默（如连接被无声掐断）时不能无限等待，
+            // 120 秒无数据视为中断，保留已生成内容
+            chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                stream.next(),
+            ) => {
                 let bytes = match chunk {
-                    Some(Ok(b)) => b,
-                    Some(Err(e)) => {
+                    Ok(Some(Ok(b))) => b,
+                    Ok(Some(Err(e))) => {
                         // 用户已停止时网络中断属正常：保留已生成内容，按"已停止"收尾
                         if token.is_cancelled() {
                             return Ok(TurnResult {
@@ -81,7 +98,26 @@ pub async fn run(
                             error: Some(format!("网络错误: {e}")),
                         });
                     }
-                    None => break,
+                    Ok(None) => break,
+                    Err(_) => {
+                        if token.is_cancelled() {
+                            return Ok(TurnResult {
+                                reasoning,
+                                content,
+                                tool_calls: Vec::new(),
+                                stopped: true,
+                                error: None,
+                            });
+                        }
+                        // 流式停滞：内容随错误一并返回，由上层先持久化再报告错误
+                        return Ok(TurnResult {
+                            reasoning,
+                            content,
+                            tool_calls: Vec::new(),
+                            stopped: false,
+                            error: Some("流式响应停滞超时（120 秒无数据），已中断".into()),
+                        });
+                    }
                 };
                 buf.extend_from_slice(&bytes);
                 loop {
@@ -255,7 +291,12 @@ pub async fn summarize(
         "messages": build_messages_json(msgs),
         "stream": false,
     });
-    let resp = send_request(state, &format!("{base}/v1/messages"), &provider.api_key, &body).await?;
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        send_request(state, &format!("{base}/v1/messages"), &provider.api_key, &body),
+    )
+    .await
+    .map_err(|_| "摘要请求超时（60 秒），本次跳过上下文压缩".to_string())??;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {

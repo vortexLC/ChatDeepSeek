@@ -781,13 +781,15 @@ impl Db {
                 + estimate_tokens(&r.tool_calls)
                 + estimate_tokens(&r.tool_results);
             // 附件：图片按固定 token 估算，文档按字节数估算
+            // （与 llm/mod.rs 的 MAX_DOC_CHARS=20000 截断一致，文档实际只会发送
+            //  截断后的前 20000 字符，估算也按此上限，避免上传大文档撑爆上下文估算）
             if let Ok(atts) = serde_json::from_str::<Vec<crate::models::Attachment>>(&r.attachments)
             {
                 for a in atts {
                     if a.kind == "image" {
                         used += crate::models::CONTEXT_IMAGE_TOKENS;
                     } else {
-                        used += (a.size.max(0) as u64) / 4;
+                        used += ((a.size.max(0) as u64) / 4).min(20_000);
                     }
                 }
             }

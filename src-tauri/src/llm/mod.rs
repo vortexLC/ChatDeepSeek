@@ -433,8 +433,14 @@ async fn run_agent_inner(
     // 上下文自动压缩：用量达到阈值时，将早期对话摘要化（LLM 摘要 + 持久化）。
     // 若本轮发生了压缩，用压缩后的 summary/summarized_until 组装请求，
     // 保证压缩当轮即生效（否则该轮仍发送全量历史，可能超模型上限）
+    // 用户已点击停止时跳过压缩，直接以"已停止"收尾
+    if token.is_cancelled() {
+        return Err("已停止生成".into());
+    }
     let mut send_conv = conv.clone();
-    if let Some((summary, until)) = try_compress_history(state, conv, provider, model).await {
+    if let Some((summary, until)) =
+        try_compress_history(state, conv, provider, model, token).await
+    {
         send_conv.summary = summary;
         send_conv.summarized_until = until;
     }
@@ -545,8 +551,13 @@ async fn try_compress_history(
     conv: &Conversation,
     provider: &ProviderConfig,
     model: &ModelConfig,
+    token: &CancelToken,
 ) -> Option<(String, i64)> {
     use crate::models::{CONTEXT_COMPRESS_THRESHOLD, CONTEXT_KEEP_LAST_MSGS};
+    // 用户已点击停止：跳过压缩，避免无谓的摘要请求
+    if token.is_cancelled() {
+        return None;
+    }
     // 用量未达阈值或模型不可用时跳过
     let usage = state.db.context_usage(conv.id);
     if usage.percent < CONTEXT_COMPRESS_THRESHOLD {
@@ -632,6 +643,10 @@ async fn try_compress_history(
             }
             _ => {}
         }
+    }
+    // 摘要请求前再次检查停止状态（摘要本身也有 60 秒超时兜底）
+    if token.is_cancelled() {
+        return None;
     }
     let summary = match provider.protocol.as_str() {
         PROTOCOL_OPENAI => openai::summarize(state, provider, model, &msgs).await,
