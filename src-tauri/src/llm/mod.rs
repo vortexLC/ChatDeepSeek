@@ -497,18 +497,35 @@ async fn run_agent_inner(
         }
 
         acc.reasoning.push_str(&turn.reasoning);
-        acc.content.push_str(&turn.content);
 
         // 流式中断（网络错误等）：内容已收进 acc，立即以错误收尾，
         // 由外层 persist 保存部分内容后再报告错误（避免"内容消失"）
         if let Some(err) = turn.error {
+            acc.content.push_str(&turn.content);
             return Err(err);
         }
 
+        // 无工具调用时尝试识别文本形式的工具调用（JSON 兜底）；
+        // 命中时展示内容剥离 JSON 参数，避免把 prompt/size 等参数展示给用户
+        let textual = if turn.tool_calls.is_empty() {
+            find_textual_tool_call(&turn.content, &conv.mode)
+        } else {
+            None
+        };
+        let display_content = match &textual {
+            Some((_, _, start, end)) => {
+                let mut c = String::with_capacity(turn.content.len());
+                c.push_str(&turn.content[..*start]);
+                c.push_str(&turn.content[*end..]);
+                c.trim().to_string()
+            }
+            None => turn.content.clone(),
+        };
+        acc.content.push_str(&display_content);
+
         if turn.tool_calls.is_empty() {
-            // 兜底：部分模型/API 不支持 function calling，会把工具参数以文本 JSON
-            // 形式输出（如 {"prompt": "..."}）。识别并代为执行，避免"只给提示词不生成"
-            if let Some((tool_name, args)) = parse_textual_tool_call(&turn.content, &conv.mode) {
+            // 文本 JSON 兜底：识别并代为执行，避免"只给提示词不生成"
+            if let Some((tool_name, args, _, _)) = textual {
                 if tools.iter().any(|t| t["name"].as_str() == Some(tool_name.as_str())) {
                     let id = format!("text_call_{}", crate::db::now_ms());
                     let calls = vec![ToolCall {
@@ -521,7 +538,7 @@ async fn run_agent_inner(
                             .await?;
                     // 按 API 要求顺序拼接上下文：assistant(tool_use) 在前，user(tool_result) 紧跟
                     cur.push(OutMsg::Assistant {
-                        content: turn.content,
+                        content: display_content,
                         tool_calls: calls,
                     });
                     for tr in results {
@@ -645,38 +662,56 @@ fn is_permission_error(e: &str) -> bool {
 /// 或把工具参数写进正文的模型）。识别优先级：
 /// 1. 整体即 JSON 对象；
 /// 2. 正文中的 ```json / ``` 代码块；
-/// 3. 正文中第一个 { 到最后一个 } 的 JSON 片段（如"### 总…系统正在根据以下
-///    参数为您绘制图像：\n```json\n{"prompt": "..."}```"）。
-/// 仅当提取的 JSON 对象含工具特征字段时返回 (工具名, 参数 JSON)。
-fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_json::Value)> {
-    let trimmed = content.trim();
-    // 收集候选 JSON 片段：整体 → 代码块 → {…} 提取
-    let mut candidates: Vec<&str> = Vec::new();
-    candidates.push(trimmed);
-    if let Some(start) = trimmed.find("```") {
-        let after = &trimmed[start + 3..];
-        if let Some(end) = after.find("```") {
-            let mut block = after[..end].trim();
+/// 3. 正文中第一个 { 到最后一个 } 的 JSON 片段。
+/// 返回 (工具名, 参数 JSON, JSON 在 content 中的起止位置 [start, end))，
+/// 位置用于把 JSON 参数从展示内容中剥离。
+fn find_textual_tool_call(
+    content: &str,
+    mode: &str,
+) -> Option<(String, serde_json::Value, usize, usize)> {
+    // 候选 1：整体即 JSON
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content.trim()) {
+        if let Some(r) = classify_textual_tool_call(&v, mode) {
+            return Some((r.0, r.1, 0, content.len()));
+        }
+    }
+    // 候选 2：```json / ``` 代码块（位置覆盖整个代码块，剥离时一并删除）
+    if let Some(start) = content.find("```") {
+        let after = &content[start + 3..];
+        if let Some(rel_end) = after.find("```") {
+            let end = start + 3 + rel_end + 3;
+            let mut block = content[start + 3..end - 3].trim();
             // 去掉代码块语言标记（```json 后的 "json"）
-            if let Some(rest) = block.strip_prefix("json").or_else(|| block.strip_prefix("JSON")) {
+            if let Some(rest) = block
+                .strip_prefix("json")
+                .or_else(|| block.strip_prefix("JSON"))
+            {
                 block = rest.trim();
             }
-            candidates.push(block);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
+                if let Some(r) = classify_textual_tool_call(&v, mode) {
+                    return Some((r.0, r.1, start, end));
+                }
+            }
         }
     }
-    if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
+    // 候选 3：正文中第一个 { 到最后一个 } 的片段
+    if let (Some(open), Some(close)) = (content.find('{'), content.rfind('}')) {
         if close > open {
-            candidates.push(&trimmed[open..=close]);
-        }
-    }
-    for cand in candidates {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
-            if let Some(r) = classify_textual_tool_call(&v, mode) {
-                return Some(r);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content[open..=close]) {
+                if let Some(r) = classify_textual_tool_call(&v, mode) {
+                    return Some((r.0, r.1, open, close + 1));
+                }
             }
         }
     }
     None
+}
+
+/// 文本工具调用识别（丢弃位置信息，供测试使用）
+#[cfg(test)]
+fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_json::Value)> {
+    find_textual_tool_call(content, mode).map(|(n, a, _, _)| (n, a))
 }
 
 /// 检测模型是否只输出了"承诺话术"（如「正在为您生成…请稍等」）而未实际调用工具。
@@ -934,6 +969,19 @@ mod tests {
         let r = parse_textual_tool_call(reply, MODE_IMAGE);
         assert!(r.is_some());
         assert_eq!(r.unwrap().1["prompt"], "猫");
+
+        // 位置信息：剥离展示内容中的 JSON 参数用
+        let reply = "为您生成了一张图片。{\"prompt\": \"猫\"}";
+        let r = find_textual_tool_call(reply, MODE_IMAGE);
+        assert!(r.is_some());
+        let (_, _, start, end) = r.unwrap();
+        assert_eq!(&reply[start..end], "{\"prompt\": \"猫\"}");
+        // 代码块整体剥离（含 ``` 标记）
+        let reply = "为您生成：\n```json\n{\"prompt\": \"狗\"}\n```";
+        let r = find_textual_tool_call(reply, MODE_IMAGE);
+        assert!(r.is_some());
+        let (_, _, start, end) = r.unwrap();
+        assert_eq!(&reply[start..end], "```json\n{\"prompt\": \"狗\"}\n```");
 
         // 含 mode 字段 → generate_video
         let r = parse_textual_tool_call(r#"{"mode": "text2video", "prompt": "视频"}"#, MODE_IMAGE);

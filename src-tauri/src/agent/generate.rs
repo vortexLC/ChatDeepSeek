@@ -34,7 +34,7 @@ pub async fn generate_image(
     }
     let image_size = args["image_size"].as_str().unwrap_or("1024x1024");
     let base = provider.api_base.trim_end_matches('/');
-    // 阿里云百炼（DashScope，*.aliyuncs.com/compatible-mode/v1）兼容模式的
+    // 阿里云百炼（DashScope，*.aliyuncs.com/compatible-mode/v1）的
     // size 参数使用「宽*高」星号格式（如 1024*1024），与 OpenAI 的 1024x1024
     // 不同，需转换，否则接口报 size 参数非法
     let is_dashscope = base.to_lowercase().contains("aliyuncs.com");
@@ -43,18 +43,10 @@ pub async fn generate_image(
     } else {
         image_size.to_string()
     };
-
-    let mut body = json!({
-        "model": model.name,
-        "prompt": prompt,
-        "size": size_param,
-        "n": 1,
-    });
-    if let Some(n) = args["negative_prompt"].as_str() {
-        if !n.is_empty() {
-            body["negative_prompt"] = json!(n);
-        }
-    }
+    let negative_prompt = args["negative_prompt"]
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
 
     emit(app, session_id, "status", Some("generating"));
     log::info!(
@@ -64,6 +56,75 @@ pub async fn generate_image(
         size_param,
         provider.name
     );
+
+    // qwen-image 系列（阿里云百炼）：原生多模态生成接口（同步），
+    // OpenAI 兼容端点 /images/generations 对其返回 404
+    let is_qwen_image = is_dashscope && model.name.to_lowercase().contains("qwen-image");
+    let images: Vec<Vec<u8>> = if is_qwen_image {
+        log::info!("[gen] 会话 {} 使用 qwen-image 原生多模态接口", session_id);
+        fetch_images_qwen(state, provider, model, &prompt, &size_param, negative_prompt.as_deref()).await?
+    } else {
+        fetch_images_compatible(state, provider, model, &prompt, &size_param, negative_prompt.as_deref()).await?
+    };
+
+    let dir = state.db.session_images_dir(session_id);
+    let _ = std::fs::create_dir_all(&dir);
+    let mut artifacts = Vec::new();
+    let mut notes = Vec::new();
+    for (i, bytes) in images.iter().enumerate() {
+        let ext = if bytes.len() > 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" {
+            "png"
+        } else if bytes.len() > 3 && &bytes[..3] == b"\xff\xd8\xff" {
+            "jpg"
+        } else if bytes.len() > 4 && &bytes[..4] == b"RIFF" {
+            "webp"
+        } else {
+            "jpg"
+        };
+        let fname = format!("img_{}_{}.{ext}", crate::db::now_ms(), i);
+        std::fs::write(dir.join(&fname), bytes)
+            .map_err(|e| format!("保存图片失败: {e}"))?;
+        artifacts.push(Artifact {
+            kind: "image".into(),
+            name: fname.clone(),
+            path: format!("images/{fname}"),
+            size: bytes.len() as i64,
+            note: prompt.clone(),
+        });
+        notes.push(format!("图片 {}: images/{fname}", i + 1));
+    }
+    log::info!(
+        "[gen] 会话 {} 图片生成完成：{} 张（模型: {}）",
+        session_id,
+        artifacts.len(),
+        model.name
+    );
+    Ok((
+        format!("已生成 {} 张图片并保存到会话目录：{}", artifacts.len(), notes.join("；")),
+        artifacts,
+    ))
+}
+
+/// OpenAI 兼容模式图片生成：POST {base}/images/generations，
+/// 解析 data[].b64_json / data[].url 并下载，返回图片字节列表
+async fn fetch_images_compatible(
+    state: &AppState,
+    provider: &ProviderConfig,
+    model: &ModelConfig,
+    prompt: &str,
+    size: &str,
+    negative_prompt: Option<&str>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let base = provider.api_base.trim_end_matches('/');
+    let mut body = json!({
+        "model": model.name,
+        "prompt": prompt,
+        "size": size,
+        "n": 1,
+    });
+    if let Some(n) = negative_prompt {
+        body["negative_prompt"] = json!(n);
+    }
     let resp = state
         .client
         .post(format!("{base}/images/generations"))
@@ -89,14 +150,11 @@ pub async fn generate_image(
     if items.is_empty() {
         return Err(format!("图片生成未返回结果: {v}"));
     }
-
-    let dir = state.db.session_images_dir(session_id);
-    let _ = std::fs::create_dir_all(&dir);
-    let mut artifacts = Vec::new();
-    let mut notes = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        let bytes: Vec<u8> = if let Some(b64) = item["b64_json"].as_str() {
-            base64_decode(b64).map_err(|e| format!("图片 base64 解码失败: {e}"))?
+    let mut out = Vec::new();
+    for item in items {
+        if let Some(b64) = item["b64_json"].as_str() {
+            let bytes = base64_decode(b64).map_err(|e| format!("图片 base64 解码失败: {e}"))?;
+            out.push(bytes);
         } else {
             let url = item["url"]
                 .as_str()
@@ -108,43 +166,102 @@ pub async fn generate_image(
                 .send()
                 .await
                 .map_err(|e| format!("下载图片失败: {e}"))?;
-            img_resp
+            let bytes = img_resp
                 .bytes()
                 .await
                 .map_err(|e| format!("读取图片失败: {e}"))?
-                .to_vec()
-        };
-        let ext = if bytes.len() > 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" {
-            "png"
-        } else if bytes.len() > 3 && &bytes[..3] == b"\xff\xd8\xff" {
-            "jpg"
-        } else if bytes.len() > 4 && &bytes[..4] == b"RIFF" {
-            "webp"
-        } else {
-            "jpg"
-        };
-        let fname = format!("img_{}_{}.{ext}", crate::db::now_ms(), i);
-        std::fs::write(dir.join(&fname), &bytes)
-            .map_err(|e| format!("保存图片失败: {e}"))?;
-        artifacts.push(Artifact {
-            kind: "image".into(),
-            name: fname.clone(),
-            path: format!("images/{fname}"),
-            size: bytes.len() as i64,
-            note: prompt.clone(),
-        });
-        notes.push(format!("图片 {}: images/{fname}", i + 1));
+                .to_vec();
+            out.push(bytes);
+        }
     }
-    log::info!(
-        "[gen] 会话 {} 图片生成完成：{} 张（模型: {}）",
-        session_id,
-        artifacts.len(),
-        model.name
-    );
-    Ok((
-        format!("已生成 {} 张图片并保存到会话目录：{}", artifacts.len(), notes.join("；")),
-        artifacts,
-    ))
+    Ok(out)
+}
+
+/// qwen-image 系列（阿里云百炼）原生多模态生成接口（同步）：
+/// POST {native}/api/v1/services/aigc/multimodal-generation/generation
+/// 请求 input.messages[].content[].text 传提示词，响应
+/// output.choices[].message.content[].image 为图片 URL（24 小时有效，立即下载）
+async fn fetch_images_qwen(
+    state: &AppState,
+    provider: &ProviderConfig,
+    model: &ModelConfig,
+    prompt: &str,
+    size: &str,
+    negative_prompt: Option<&str>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let native_base = native_dashscope_base(&provider.api_base);
+    let url = format!("{native_base}/api/v1/services/aigc/multimodal-generation/generation");
+    let mut parameters = json!({
+        "size": size,
+        "n": 1,
+        "watermark": false,
+    });
+    if let Some(n) = negative_prompt {
+        parameters["negative_prompt"] = json!(n);
+    }
+    let body = json!({
+        "model": model.name,
+        "input": {
+            "messages": [{
+                "role": "user",
+                "content": [{"text": prompt}]
+            }]
+        },
+        "parameters": parameters,
+    });
+    let resp = state
+        .client
+        .post(&url)
+        .bearer_auth(&provider.api_key)
+        .timeout(std::time::Duration::from_secs(180))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("qwen-image 生成请求失败: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "qwen-image API 错误 ({status}): {}",
+            text.chars().take(300).collect::<String>()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("qwen-image 响应解析失败: {e}"))?;
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(choices) = v["output"]["choices"].as_array() {
+        for c in choices {
+            if let Some(content) = c["message"]["content"].as_array() {
+                for block in content {
+                    if let Some(u) = block["image"].as_str() {
+                        urls.push(u.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if urls.is_empty() {
+        return Err(format!("qwen-image 未返回图片: {v}"));
+    }
+    let mut out = Vec::new();
+    for u in urls {
+        let img_resp = state
+            .client
+            .get(&u)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("下载图片失败: {e}"))?;
+        let bytes = img_resp
+            .bytes()
+            .await
+            .map_err(|e| format!("读取图片失败: {e}"))?
+            .to_vec();
+        out.push(bytes);
+    }
+    Ok(out)
 }
 
 /// 生成视频：提交视频任务后立即返回，后台轮询状态，
