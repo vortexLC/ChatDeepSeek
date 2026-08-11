@@ -136,7 +136,7 @@ impl Db {
                     }
                     self.ensure_session_dirs(id);
                     if let Err(e) = self.write_session(&conv) {
-                        eprintln!("[db] 迁移旧会话 {id} 失败: {e}");
+                        log::error!("[db] 迁移旧会话 {id} 失败: {e}");
                         return;
                     }
                     let _ = fs::remove_file(&legacy);
@@ -391,7 +391,7 @@ impl Db {
         if let Some(mut conv) = self.read_session(id) {
             conv.updated_at = now_ms();
             if let Err(e) = self.write_session(&conv) {
-                eprintln!("[db] 更新会话 {id} 时间戳失败: {e}");
+                log::error!("[db] 更新会话 {id} 时间戳失败: {e}");
             }
         }
     }
@@ -402,7 +402,7 @@ impl Db {
             if conv.title == "新对话" || conv.title.is_empty() {
                 conv.title = content.chars().take(30).collect();
                 if let Err(e) = self.write_session(&conv) {
-                    eprintln!("[db] 设置会话 {id} 标题失败: {e}");
+                    log::error!("[db] 设置会话 {id} 标题失败: {e}");
                 }
             }
         }

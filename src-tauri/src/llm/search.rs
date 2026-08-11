@@ -77,6 +77,14 @@ pub async fn execute_search(
 
     emit(app, conv_id, "status", Some("searching"));
     emit_provider(app, conv_id, &chosen);
+    log::info!(
+        "[search] 会话 {} 搜索「{}」→ {}（策略: {}, 结果上限: {}）",
+        conv_id,
+        query.chars().take(60).collect::<String>(),
+        chosen,
+        strategy,
+        max_results
+    );
 
     let mut outcome = match chosen.as_str() {
         "anysearch" => {
@@ -97,6 +105,11 @@ pub async fn execute_search(
     }
 
     let final_outcome = outcome.map_err(|e| format!("搜索失败: {e}"))?;
+    log::info!(
+        "[search] 会话 {} 搜索完成：{} 条结果",
+        conv_id,
+        final_outcome.items.len()
+    );
     for item in &final_outcome.items {
         emit_item(app, conv_id, item);
     }

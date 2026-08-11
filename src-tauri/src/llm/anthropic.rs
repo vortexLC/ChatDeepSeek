@@ -424,6 +424,7 @@ pub fn api_error(status: u16, text: &str) -> String {
         })
         .unwrap_or_else(|| text.chars().take(300).collect());
     let mut msg = format!("API 错误 ({status}): {parsed}");
+    log::error!("[api] Anthropic 协议请求失败 ({status}): {}", parsed);
     if status == 401 || status == 403 {
         msg.push_str("。请检查服务商 API Key 是否正确（可在 设置 → 服务商 中测试连接）");
     }

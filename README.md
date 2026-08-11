@@ -303,6 +303,7 @@ web_search(query, provider?)
 ```
 data/
 ├── json/          # 应用设置（settings.json，含 API Key 与服务商配置）
+├── logs/          # 运行日志（app.log，1MB 轮转保留全部；含前端 console 转发与错误上报）
 └── sessions/      # 会话数据：每个会话一个项目目录
     └── <会话ID>/
         ├── session.json   # 会话元数据（标题/模型/模式/开关/压缩摘要）
@@ -312,6 +313,8 @@ data/
         ├── videos/        # 视频产物（Video/Agent 模式）
         └── uploads/       # 用户上传的附件
 ```
+
+- **运行日志**：`data/logs/app.log` 记录关键运行情况与错误（会话操作、消息发送、工具调用与耗时、图片/视频生成任务、联网搜索、API 错误、前端错误等），按 1MB 轮转保留全部历史，排查问题可直接查看
 
 - **原子写入**：session.json 与 settings.json 均采用「临时文件 + 重命名」写入，崩溃不会损坏配置
 - **自动迁移**：旧版单文件 `<会话ID>.json` 自动迁移为会话目录结构

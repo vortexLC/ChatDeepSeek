@@ -347,14 +347,29 @@ pub async fn run_agent(
     settings: AppSettings,
     token: Arc<CancelToken>,
 ) {
+    let started = std::time::Instant::now();
+    log::info!(
+        "[agent] 会话 {} 开始生成（模式: {}, 模型: {}, 联网搜索: {}, 深度思考: {}）",
+        conv.id,
+        conv.mode,
+        conv.model,
+        conv.web_search,
+        conv.deep_think
+    );
     emit(&app, conv.id, "status", Some("thinking"));
     let mut acc = Accum::default();
     let result = run_agent_inner(&app, &state, &state, &conv, &settings, &token, &mut acc).await;
     match result {
         Ok(()) => {
+            log::info!(
+                "[agent] 会话 {} 生成完成，耗时 {:?}，输出 {} 字符",
+                conv.id,
+                started.elapsed(),
+                acc.content.chars().count()
+            );
             if let Err(e) = persist(&state, &conv, &acc) {
                 // 回复已生成但保存失败：明确告知用户，避免"内容消失"而不知原因
-                eprintln!("[persist] 会话 {} 回复保存失败: {e}", conv.id);
+                log::error!("[persist] 会话 {} 回复保存失败: {e}", conv.id);
                 emit(&app, conv.id, "error", Some(&e));
                 return;
             }
@@ -363,15 +378,17 @@ pub async fn run_agent(
         Err(msg) => {
             if !acc.is_empty() {
                 if let Err(e) = persist(&state, &conv, &acc) {
-                    eprintln!("[persist] 会话 {} 部分回复保存失败: {e}", conv.id);
+                    log::error!("[persist] 会话 {} 部分回复保存失败: {e}", conv.id);
                     emit(&app, conv.id, "error", Some(&e));
                     return;
                 }
             }
             // 用户主动停止不是错误：以独立事件静默收尾，避免弹出红色错误横幅
             if msg == "已停止生成" {
+                log::info!("[agent] 会话 {} 已停止，耗时 {:?}", conv.id, started.elapsed());
                 emit(&app, conv.id, "stopped", None);
             } else {
+                log::warn!("[agent] 会话 {} 出错，耗时 {:?}: {}", conv.id, started.elapsed(), msg);
                 emit(&app, conv.id, "error", Some(&msg));
             }
         }
@@ -573,6 +590,7 @@ async fn execute_tool_calls(
         if token.is_cancelled() {
             return Err("已停止生成".into());
         }
+        let started = std::time::Instant::now();
         let outcome = match tools::execute_tool(
             app, state_arc, conv_id, &tc.name, &tc.arguments, settings, token,
         )
@@ -581,13 +599,24 @@ async fn execute_tool_calls(
             Ok(o) => o,
             Err(e) if is_permission_error(&e) => {
                 // 权限拒绝不是致命错误：作为工具结果返回给模型继续
+                log::info!("[tool] 会话 {} 调用 {} 被用户拒绝", conv_id, tc.name);
                 tools::ToolOutcome {
                     content: e,
                     artifacts: Vec::new(),
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                log::error!("[tool] 会话 {} 调用 {} 失败: {}", conv_id, tc.name, e);
+                return Err(e);
+            }
         };
+        log::info!(
+            "[tool] 会话 {} 调用 {} 完成，耗时 {:?}，产物 {} 个",
+            conv_id,
+            tc.name,
+            started.elapsed(),
+            outcome.artifacts.len()
+        );
         // 产物实时推送到前端
         for art in &outcome.artifacts {
             emit_artifact(app, conv_id, art);
@@ -853,9 +882,15 @@ async fn try_compress_history(
     };
     let Ok(summary) = summary else {
         // 摘要失败不应静默：记录日志便于定位（压缩是长会话免于"上下文已满"的关键）
-        eprintln!("[compress] 会话 {} 摘要生成失败", conv.id);
+        log::error!("[compress] 会话 {} 摘要生成失败", conv.id);
         return None;
     };
+    log::info!(
+        "[compress] 会话 {} 自动压缩完成：摘要 {} 字符，压缩至消息 {}",
+        conv.id,
+        summary.chars().count(),
+        cutoff_id - 1
+    );
     let _ = state
         .db
         .update_conversation_summary(conv.id, &summary, cutoff_id - 1);

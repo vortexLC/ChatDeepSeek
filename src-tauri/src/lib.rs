@@ -12,6 +12,7 @@ use crate::{commands::AppState, db::Db};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
 
 /// 用户点击托盘"退出"后置为 true，允许窗口真正关闭
 static EXITING: AtomicBool = AtomicBool::new(false);
@@ -109,8 +110,31 @@ fn resolve_data_root() -> Option<PathBuf> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 日志目录：数据根目录下的 logs/（开发在项目根 data/logs，生产在 exe 旁 data/logs）。
+    // 日志文件按 1MB 轮转，保留全部历史；同时输出到控制台与 WebView（前端 console）
+    let log_dir = resolve_data_root()
+        .unwrap_or_else(|| PathBuf::from("data"))
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    Target::new(TargetKind::Stdout),
+                    Target::new(TargetKind::Folder {
+                        path: log_dir,
+                        file_name: Some("app.log".into()),
+                    }),
+                    Target::new(TargetKind::Webview),
+                ])
+                .level(log::LevelFilter::Info)
+                .max_file_size(1_000_000)
+                .rotation_strategy(RotationStrategy::KeepAll)
+                .timezone_strategy(TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .on_window_event(|window, event| {
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
@@ -138,11 +162,13 @@ pub fn run() {
                 root = app_data.join("data");
                 std::fs::create_dir_all(&root)?;
             }
+            log::info!("应用启动，数据目录: {}", root.display());
             let db = Db::open(&root)?;
             // 遗留设置迁移：旧版 deepseek / gen 配置 -> 统一模型提供商体系
             let settings = db.get_settings();
             let migrated = crate::models::migrate_legacy_providers(&settings);
             if migrated.providers != settings.providers {
+                log::info!("检测到旧版设置，迁移至统一服务商体系");
                 let _ = db.save_settings(&migrated);
             }
             let state = Arc::new(AppState::new(db)?);

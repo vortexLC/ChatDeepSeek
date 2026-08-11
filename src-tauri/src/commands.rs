@@ -284,6 +284,7 @@ pub fn update_conversation(
 
 #[tauri::command]
 pub fn delete_conversation(state: State<Arc<AppState>>, id: i64) -> Result<(), String> {
+    log::info!("[chat] 删除会话 {id}");
     cancel_session_tasks(&state, id);
     state.db.delete_conversation(id)
 }
@@ -304,6 +305,7 @@ pub fn list_jobs(
 pub fn clear_all_conversations(state: State<Arc<AppState>>) -> Result<(), String> {
     // 先取消所有进行中的任务（agent + 视频轮询），否则它们会在目录删除后继续
     // 轮询/写库，把已清空的会话目录与消息库"复活"成僵尸数据
+    log::info!("[chat] 清空所有会话");
     cancel_all_tasks(&state);
     state.db.clear_all()
 }
@@ -351,6 +353,12 @@ pub async fn send_message(
 
     let trimmed = content.trim().to_string();
     let uploads = attachments.unwrap_or_default();
+    log::info!(
+        "[chat] 会话 {} 发送消息（{} 字符，附件 {} 个）",
+        conversation_id,
+        trimmed.chars().count(),
+        uploads.len()
+    );
     if trimmed.is_empty() && uploads.is_empty() {
         return err("消息内容为空");
     }
@@ -411,6 +419,13 @@ pub async fn edit_and_resend(
     }
     let trimmed = content.trim().to_string();
     let uploads = attachments.unwrap_or_default();
+    log::info!(
+        "[chat] 会话 {} 编辑消息 {} 并重新发送（{} 字符，附件 {} 个）",
+        conversation_id,
+        message_id,
+        trimmed.chars().count(),
+        uploads.len()
+    );
     if trimmed.is_empty() && uploads.is_empty() {
         return err("消息内容为空");
     }
@@ -496,6 +511,7 @@ fn spawn_agent(
 
 #[tauri::command]
 pub fn stop_generation(state: State<Arc<AppState>>, conversation_id: i64) -> Result<(), String> {
+    log::info!("[chat] 停止会话 {conversation_id} 生成");
     if let Some(token) = state.cancels.lock().unwrap().get(&conversation_id) {
         token.cancel();
     }

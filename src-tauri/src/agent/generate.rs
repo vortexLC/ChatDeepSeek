@@ -57,6 +57,13 @@ pub async fn generate_image(
     }
 
     emit(app, session_id, "status", Some("generating"));
+    log::info!(
+        "[gen] 会话 {} 开始生成图片（模型: {}, 尺寸: {}, 服务商: {}）",
+        session_id,
+        model.name,
+        size_param,
+        provider.name
+    );
     let resp = state
         .client
         .post(format!("{base}/images/generations"))
@@ -128,6 +135,12 @@ pub async fn generate_image(
         });
         notes.push(format!("图片 {}: images/{fname}", i + 1));
     }
+    log::info!(
+        "[gen] 会话 {} 图片生成完成：{} 张（模型: {}）",
+        session_id,
+        artifacts.len(),
+        model.name
+    );
     Ok((
         format!("已生成 {} 张图片并保存到会话目录：{}", artifacts.len(), notes.join("；")),
         artifacts,
@@ -396,6 +409,12 @@ async fn generate_video_siliconflow(
     let job_id = state
         .db
         .create_job(session_id, "video", VIDEO_API_SILICONFLOW, &used_model, &request_id)?;
+    log::info!(
+        "[gen] 会话 {} 视频任务已提交（硅基流动，模型: {}, requestId: {}）",
+        session_id,
+        used_model,
+        request_id
+    );
     if let Some(job) = state.db.get_job(session_id, job_id) {
         let payload = json!({
             "kind": "video_submitted",
@@ -827,6 +846,12 @@ async fn generate_video_dashscope(
     let job_id = state
         .db
         .create_job(session_id, "video", VIDEO_API_DASHSCOPE, &model.name, &task_id)?;
+    log::info!(
+        "[gen] 会话 {} 视频任务已提交（阿里云百炼，模型: {}, task_id: {}）",
+        session_id,
+        model.name,
+        task_id
+    );
     if let Some(job) = state.db.get_job(session_id, job_id) {
         let payload = json!({
             "kind": "video_submitted",
@@ -896,6 +921,12 @@ pub(crate) fn spawn_video_poller(
                 if token.is_cancelled() || st.db.get_conversation(session_id).is_none() {
                     return;
                 }
+                log::info!(
+                    "[gen] 会话 {} 视频任务完成（{}，{} 字节）",
+                    session_id,
+                    artifact.name,
+                    artifact.size
+                );
                 let _ = st.db.finish_job(session_id, job_id, &artifact);
                 let job = st.db.get_job(session_id, job_id);
                 let submitted_at = job.as_ref().map(|j| j.submitted_at).unwrap_or_else(crate::db::now_ms);
@@ -914,7 +945,7 @@ pub(crate) fn spawn_video_poller(
                     Some(job_id),
                 ) {
                     // 完成消息保存失败（磁盘/权限问题）：记录日志，避免视频"生成成功却无声无息丢失"
-                    eprintln!("[video] 会话 {session_id} 完成消息保存失败: {e}");
+                    log::error!("[video] 会话 {session_id} 完成消息保存失败: {e}");
                     return;
                 }
                 st.db.touch(session_id);
@@ -931,7 +962,10 @@ pub(crate) fn spawn_video_poller(
                 // 主动取消（删除/编辑会话）时任务已在 DB 中标记为 canceled，
                 // 这里不再覆盖状态，仅推送"已取消"事件
                 let canceled = e == "任务已取消";
-                if !canceled {
+                if canceled {
+                    log::info!("[gen] 会话 {} 视频任务已取消", session_id);
+                } else {
+                    log::error!("[gen] 会话 {} 视频任务失败: {}", session_id, e);
                     let _ = st.db.fail_job(session_id, job_id, &e);
                 }
                 let job = st.db.get_job(session_id, job_id);
