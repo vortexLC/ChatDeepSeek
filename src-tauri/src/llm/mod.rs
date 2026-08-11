@@ -747,13 +747,51 @@ fn promise_reminder_hint(content: &str, mode: &str) -> Option<String> {
     ))
 }
 
-/// 按工具特征字段分类 JSON 对象 → (工具名, 参数 JSON)
+/// 已知工具名集合（文本兜底识别的合法范围）
+const KNOWN_TOOL_NAMES: [&str; 11] = [
+    tools::TOOL_WEB_SEARCH,
+    tools::TOOL_READ_FILE,
+    tools::TOOL_WRITE_FILE,
+    tools::TOOL_EDIT_FILE,
+    tools::TOOL_DELETE_FILE,
+    tools::TOOL_LIST_FILES,
+    tools::TOOL_GLOB,
+    tools::TOOL_GREP,
+    tools::TOOL_BASH,
+    tools::TOOL_GENERATE_IMAGE,
+    tools::TOOL_GENERATE_VIDEO,
+];
+
+/// 按工具特征字段分类 JSON 对象 → (工具名, 参数 JSON)。
+/// 支持两种形态：
+/// 1. 包装格式 {"name": "generate_image", "arguments": {"prompt": "..."}}
+///    （模型模拟 OpenAI tool_call 结构，arguments 可为对象或 JSON 字符串）；
+/// 2. 平铺字段（{"prompt": ...}、{"path": ...}、{"command": ...} 等）。
 fn classify_textual_tool_call(
     v: &serde_json::Value,
     mode: &str,
 ) -> Option<(String, serde_json::Value)> {
     let obj = v.as_object()?;
-    // ---- 生成工具 ----
+
+    // ---- 包装格式 ----
+    if let (Some(name), Some(args_raw)) = (
+        obj.get("name").and_then(|n| n.as_str()),
+        obj.get("arguments"),
+    ) {
+        let args = match args_raw {
+            serde_json::Value::Object(_) => args_raw.clone(),
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).ok()?,
+            _ => return None,
+        };
+        let non_empty = args.as_object().map(|o| !o.is_empty()).unwrap_or(false);
+        if non_empty && KNOWN_TOOL_NAMES.contains(&name) {
+            return Some((name.to_string(), args));
+        }
+        // 包装格式但 name 未知/参数为空：不继续按平铺判断（结构已明确是包装格式）
+        return None;
+    }
+
+    // ---- 生成工具（平铺字段）----
     if let Some(prompt) = obj.get("prompt").and_then(|p| p.as_str()) {
         if !prompt.trim().is_empty() {
             let video_hint = obj.contains_key("mode")
@@ -982,6 +1020,33 @@ mod tests {
         assert!(r.is_some());
         let (_, _, start, end) = r.unwrap();
         assert_eq!(&reply[start..end], "```json\n{\"prompt\": \"狗\"}\n```");
+
+        // 包装格式（模型模拟 tool_call 结构：name + arguments）
+        let r = parse_textual_tool_call(
+            r#"{"name": "generate_image", "arguments": {"prompt": "一只猫"}}"#,
+            MODE_IMAGE,
+        );
+        assert!(r.is_some());
+        let (name, args) = r.unwrap();
+        assert_eq!(name, tools::TOOL_GENERATE_IMAGE);
+        assert_eq!(args["prompt"], "一只猫");
+
+        // arguments 为 JSON 字符串
+        let r = parse_textual_tool_call(
+            r#"{"name": "generate_image", "arguments": "{\"prompt\": \"狗\"}"}"#,
+            MODE_IMAGE,
+        );
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().1["prompt"], "狗");
+
+        // 未知 name → 不识别
+        assert!(
+            parse_textual_tool_call(
+                r#"{"name": "hack", "arguments": {"prompt": "x"}}"#,
+                MODE_IMAGE
+            )
+            .is_none()
+        );
 
         // 含 mode 字段 → generate_video
         let r = parse_textual_tool_call(r#"{"mode": "text2video", "prompt": "视频"}"#, MODE_IMAGE);
