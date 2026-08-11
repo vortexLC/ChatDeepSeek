@@ -516,6 +516,17 @@ async fn run_agent_inner(
                     continue;
                 }
             }
+            // 承诺话术纠正：模型只说「正在为您生成…请稍等」而未实际调用工具时，
+            // 不结束回合，回喂提示要求提供工具参数（模型随后输出 JSON 由上面兜底执行），
+            // 避免"说而不做"直接结束
+            if let Some(hint) = promise_reminder_hint(&turn.content, &conv.mode) {
+                cur.push(OutMsg::User {
+                    content: hint,
+                    images: Vec::new(),
+                    docs: String::new(),
+                });
+                continue;
+            }
             break;
         }
 
@@ -637,6 +648,39 @@ fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_j
         }
     }
     None
+}
+
+/// 检测模型是否只输出了"承诺话术"（如「正在为您生成…请稍等」）而未实际调用工具。
+/// 命中时返回回喂提示，要求模型提供工具参数（随后模型输出 JSON 由文本兜底执行）。
+/// 约束：仅生成模式、内容含承诺词、且内容较短（长回答不打断）。
+fn promise_reminder_hint(content: &str, mode: &str) -> Option<String> {
+    let c = content.trim();
+    if c.chars().count() > 200 {
+        return None;
+    }
+    const PROMISE_WORDS: [&str; 6] = ["正在生成", "请稍等", "请稍候", "马上", "为您生成", "开始生成"];
+    if !PROMISE_WORDS.iter().any(|w| c.contains(w)) {
+        return None;
+    }
+    let tool_hint = match mode {
+        MODE_IMAGE => format!(
+            "请立即调用 {} 工具并提供参数（图片描述 prompt）",
+            tools::TOOL_GENERATE_IMAGE
+        ),
+        MODE_VIDEO => format!(
+            "请立即调用 {} 工具并提供参数（mode 与 prompt）",
+            tools::TOOL_GENERATE_VIDEO
+        ),
+        MODE_AGENT => format!(
+            "请立即调用相应工具并提供参数（如 {} 的 prompt、{} 的 mode/prompt、或文件操作参数）",
+            tools::TOOL_GENERATE_IMAGE,
+            tools::TOOL_GENERATE_VIDEO
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "你尚未真正调用工具，只说了一句承诺话术。{tool_hint}，不要只说「正在生成」之类的文字。"
+    ))
 }
 
 /// 按工具特征字段分类 JSON 对象 → (工具名, 参数 JSON)
@@ -893,5 +937,17 @@ mod tests {
         assert!(is_permission_error("权限确认已失效"));
         assert!(!is_permission_error("图片生成 API 错误 (400)"));
         assert!(!is_permission_error("已停止生成"));
+
+        // 承诺话术纠正
+        let h = promise_reminder_hint("正在为您生成中式古风庭院图片，请稍等。", MODE_IMAGE);
+        assert!(h.is_some());
+        assert!(h.unwrap().contains("generate_image"));
+        let h = promise_reminder_hint("马上为您生成视频，请稍候。", MODE_VIDEO);
+        assert!(h.is_some());
+        assert!(h.unwrap().contains("generate_video"));
+        // 无承诺词 / 长回答 / 非生成模式 → 不打断
+        assert!(promise_reminder_hint("好的，我来分析一下这个问题。", MODE_IMAGE).is_none());
+        assert!(promise_reminder_hint("正在生成".repeat(120).as_str(), MODE_IMAGE).is_none());
+        assert!(promise_reminder_hint("正在生成", MODE_CHAT).is_none());
     }
 }
