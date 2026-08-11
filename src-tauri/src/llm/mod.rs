@@ -168,7 +168,7 @@ fn today_cn() -> String {
 pub(crate) fn build_system_prompt(conv: &Conversation) -> String {
     let date = today_cn();
     let mode_hint = match conv.mode.as_str() {
-        MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件。",
+        MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件（访问越界需用户确认）。若你的实现确实无法发起函数调用，请直接输出 JSON 形式的工具参数（如 {\"path\": \"src/main.rs\", \"content\": \"...\"}、{\"path\": \"a.txt\"}、{\"command\": \"dir\"}），系统会自动识别并执行。",
         MODE_AGENT => "\n\n【当前模式：Agent】你拥有以下全部工具能力：\n\
 1. 编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）：在本会话隔离目录中读写文件、执行命令，完成开发任务；\n\
 2. generate_image：生成图片。当用户要求生成、绘制、设计图片/图像/插画/海报/壁纸等任何视觉内容时，必须调用此工具——系统会调用专门的绘图模型完成生成并自动保存；\n\
@@ -549,7 +549,9 @@ async fn run_agent_inner(
     Ok(())
 }
 
-/// 执行一组工具调用：逐个执行、推送产物、累计到 acc，返回按顺序的 ToolResult
+/// 执行一组工具调用：逐个执行、推送产物、累计到 acc，返回按顺序的 ToolResult。
+/// 权限确认类错误（用户拒绝/超时）不终止任务：转为工具结果回喂模型，
+/// 让其调整策略（如改用会话内路径）继续，而非整个生成直接失败
 async fn execute_tool_calls(
     app: &AppHandle,
     state_arc: &Arc<AppState>,
@@ -564,9 +566,21 @@ async fn execute_tool_calls(
         if token.is_cancelled() {
             return Err("已停止生成".into());
         }
-        let outcome =
-            tools::execute_tool(app, state_arc, conv_id, &tc.name, &tc.arguments, settings, token)
-                .await?;
+        let outcome = match tools::execute_tool(
+            app, state_arc, conv_id, &tc.name, &tc.arguments, settings, token,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) if is_permission_error(&e) => {
+                // 权限拒绝不是致命错误：作为工具结果返回给模型继续
+                tools::ToolOutcome {
+                    content: e,
+                    artifacts: Vec::new(),
+                }
+            }
+            Err(e) => return Err(e),
+        };
         // 产物实时推送到前端
         for art in &outcome.artifacts {
             emit_artifact(app, conv_id, art);
@@ -584,11 +598,23 @@ async fn execute_tool_calls(
     Ok(results)
 }
 
+/// 权限确认类错误（用户拒绝/确认超时/确认失效）：非致命，转为工具结果回喂模型
+fn is_permission_error(e: &str) -> bool {
+    e.starts_with("用户拒绝了该操作")
+        || e.starts_with("等待用户确认超时")
+        || e.starts_with("权限确认已失效")
+}
+
 /// 从模型文本回复中识别"文本形式的工具调用"（兼容不支持 function calling 的模型）。
-/// 仅当内容整体是合法 JSON 对象且含 prompt 字段时返回 (工具名, 参数 JSON)。
-/// - 含 mode/image/images 字段或当前为 Video 模式 → generate_video
-/// - 否则 Image / Agent 模式 → generate_image
-/// 避免误判：非 JSON、无 prompt、或非生成模式一律返回 None
+/// 仅当内容整体是合法 JSON 对象且包含工具特征字段时返回 (工具名, 参数 JSON)。
+/// 生成工具：
+/// - 含 prompt 且（含 mode/image/images 或 Video 模式）→ generate_video
+/// - 含 prompt 且 Image / Agent 模式 → generate_image
+/// 文件工具（Build / Agent 模式）：
+/// - 含 command → bash；含 old_string → edit_file
+/// - 含 path + content → write_file；仅含 path → read_file（只读安全）
+/// - 含 pattern → grep；含 dir → list_files
+/// 避免误判：非 JSON、无特征字段、或非对应模式一律返回 None
 fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_json::Value)> {
     let trimmed = content.trim();
     // 允许 ```json ... ``` 代码块包裹
@@ -600,21 +626,48 @@ fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_j
         .unwrap_or(trimmed);
     let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
     let obj = v.as_object()?;
-    let prompt = obj.get("prompt").and_then(|p| p.as_str())?;
-    if prompt.trim().is_empty() {
-        return None;
+
+    // ---- 生成工具 ----
+    if let Some(prompt) = obj.get("prompt").and_then(|p| p.as_str()) {
+        if !prompt.trim().is_empty() {
+            let video_hint = obj.contains_key("mode")
+                || obj.contains_key("image")
+                || obj.contains_key("images")
+                || mode == MODE_VIDEO;
+            if video_hint {
+                return Some((tools::TOOL_GENERATE_VIDEO.to_string(), v));
+            }
+            if mode == MODE_IMAGE || mode == MODE_AGENT {
+                return Some((tools::TOOL_GENERATE_IMAGE.to_string(), v));
+            }
+        }
     }
-    let video_hint = obj.contains_key("mode")
-        || obj.contains_key("image")
-        || obj.contains_key("images")
-        || mode == MODE_VIDEO;
-    if video_hint {
-        Some((tools::TOOL_GENERATE_VIDEO.to_string(), v))
-    } else if mode == MODE_IMAGE || mode == MODE_AGENT {
-        Some((tools::TOOL_GENERATE_IMAGE.to_string(), v))
-    } else {
-        None
+
+    // ---- 文件工具（Build / Agent）----
+    if mode == MODE_BUILD || mode == MODE_AGENT {
+        if obj.contains_key("command") {
+            return Some((tools::TOOL_BASH.to_string(), v));
+        }
+        if let Some(path) = obj.get("path").and_then(|p| p.as_str()) {
+            if !path.trim().is_empty() {
+                if obj.contains_key("old_string") {
+                    return Some((tools::TOOL_EDIT_FILE.to_string(), v));
+                }
+                if obj.contains_key("content") {
+                    return Some((tools::TOOL_WRITE_FILE.to_string(), v));
+                }
+                // 仅 path：只读安全，按 read_file 处理
+                return Some((tools::TOOL_READ_FILE.to_string(), v));
+            }
+        }
+        if obj.contains_key("pattern") {
+            return Some((tools::TOOL_GREP.to_string(), v));
+        }
+        if obj.contains_key("dir") {
+            return Some((tools::TOOL_LIST_FILES.to_string(), v));
+        }
     }
+    None
 }
 
 fn emit_artifact(app: &AppHandle, conv_id: i64, artifact: &Artifact) {
@@ -778,5 +831,30 @@ mod tests {
         assert!(parse_textual_tool_call("你好，有什么可以帮你", MODE_IMAGE).is_none());
         assert!(parse_textual_tool_call(r#"{"a": 1}"#, MODE_IMAGE).is_none());
         assert!(parse_textual_tool_call(r#"{"prompt": "x"}"#, MODE_CHAT).is_none());
+
+        // 文件工具（Build / Agent 模式）
+        let r = parse_textual_tool_call(r#"{"path": "a.txt"}"#, MODE_BUILD);
+        assert_eq!(r.unwrap().0, tools::TOOL_READ_FILE);
+        let r = parse_textual_tool_call(r#"{"path": "a.txt", "content": "hi"}"#, MODE_BUILD);
+        assert_eq!(r.unwrap().0, tools::TOOL_WRITE_FILE);
+        let r = parse_textual_tool_call(r#"{"path": "a.txt", "old_string": "x", "new_string": "y"}"#, MODE_AGENT);
+        assert_eq!(r.unwrap().0, tools::TOOL_EDIT_FILE);
+        let r = parse_textual_tool_call(r#"{"command": "dir"}"#, MODE_BUILD);
+        assert_eq!(r.unwrap().0, tools::TOOL_BASH);
+        let r = parse_textual_tool_call(r#"{"pattern": "hello"}"#, MODE_BUILD);
+        assert_eq!(r.unwrap().0, tools::TOOL_GREP);
+        let r = parse_textual_tool_call(r#"{"dir": "src"}"#, MODE_AGENT);
+        assert_eq!(r.unwrap().0, tools::TOOL_LIST_FILES);
+
+        // 文件工具 JSON 在 Image / Chat 模式不识别
+        assert!(parse_textual_tool_call(r#"{"path": "a.txt"}"#, MODE_IMAGE).is_none());
+        assert!(parse_textual_tool_call(r#"{"command": "dir"}"#, MODE_CHAT).is_none());
+
+        // 权限拒绝错误识别
+        assert!(is_permission_error("用户拒绝了该操作：bash cd /d C:\\"));
+        assert!(is_permission_error("等待用户确认超时，已拒绝该操作"));
+        assert!(is_permission_error("权限确认已失效"));
+        assert!(!is_permission_error("图片生成 API 错误 (400)"));
+        assert!(!is_permission_error("已停止生成"));
     }
 }
