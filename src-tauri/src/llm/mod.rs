@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 use tauri::{AppHandle, Emitter};
@@ -77,6 +78,9 @@ pub struct TurnResult {
     pub tool_calls: Vec<ToolCall>,
     /// 流式中途被用户停止：content/reasoning 为部分生成结果，需保留并持久化
     pub stopped: bool,
+    /// 流式中断（网络错误等，非用户操作）：content/reasoning 为已生成的部分内容，
+    /// 由上层先持久化再报告错误，避免已流式输出的内容随错误一起丢失
+    pub error: Option<String>,
 }
 
 #[derive(Default)]
@@ -136,6 +140,79 @@ fn extract_document_text(path: &std::path::Path) -> Option<String> {
         }
         _ => std::fs::read_to_string(path).ok(),
     }
+}
+
+/// 当前日期（中国时区，YYYY-MM-DD），用于系统提示词
+fn today_cn() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = (secs + 8 * 3600) / 86400;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y}-{m:02}-{d:02}")
+}
+
+/// 构建系统提示词（Anthropic / OpenAI 协议共用）。
+/// 按会话模式附加工具使用说明；生成类模式明确要求模型调用生成工具、禁止以
+/// "文本模型无法生成"为由拒绝，也不要让用户复制提示词去外部工具生成。
+pub(crate) fn build_system_prompt(conv: &Conversation) -> String {
+    let date = today_cn();
+    let mode_hint = match conv.mode.as_str() {
+        MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件。",
+        MODE_AGENT => "\n\n【当前模式：Agent】你拥有以下全部工具能力：\n\
+1. 编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）：在本会话隔离目录中读写文件、执行命令，完成开发任务；\n\
+2. generate_image：生成图片。当用户要求生成、绘制、设计图片/图像/插画/海报/壁纸等任何视觉内容时，必须调用此工具——系统会调用专门的绘图模型完成生成并自动保存；\n\
+3. generate_video：生成视频。当用户要求生成视频/动画/短片时，必须调用此工具（耗时约几分钟）。\n\
+【重要】\n\
+- 你确实具备图片与视频生成能力（由上述工具调用专门模型实现）。严禁回复「我无法生成图片/视频」「作为文本/语言模型我不能…」「你可以把提示词复制到 Midjourney / Stable Diffusion / Runway / 可灵等工具中」之类的话术。\n\
+- 需要生成时，立即实际发起对应工具调用。严禁只在回复正文里描述或罗列「调用 generate_image：prompt: …」这类文字而不真正调用工具；也严禁只说「正在为您生成」却不发起调用。调用工具前不要输出冗长的计划、分镜脚本或提示词设计。\n\
+- 用户要求「先生成图片、再基于该图生成视频」时：先调用 generate_image，等拿到图片结果（含 images/xxx.png 路径）后，再调用 generate_video（mode=image2video，image 传刚生成的图片路径 images/xxx.png）。",
+        MODE_IMAGE => "\n\n【当前模式：Image】你具备图片生成能力：当用户要求生成、绘制、设计任何图片/图像/插画/海报/壁纸等视觉内容时，必须调用 generate_image 工具——系统会调用专门的绘图模型完成生成并自动保存。\n\
+【重要】严禁回复「我无法生成图片」「作为文本模型我不能画图」「请去 Midjourney / Stable Diffusion 等外部工具」等话术，也不要只输出提示词。需要生成时立即实际发起 generate_image 工具调用，不要在正文里描述「调用 generate_image：…」而不真正调用。",
+        MODE_VIDEO => "\n\n【当前模式：Video】你具备视频生成能力：当用户要求生成视频/动画/短片时，必须调用 generate_video 工具，并按需选择 mode：text2video 文生视频（无需图片）；image2video 图生视频（图片作首帧）；reference2video 参考图生视频（参考图片风格/主体，需 r2v 模型）。image/images 可传图片 URL、base64 或本会话内图片路径（如 images/xxx.png，即 generate_image 的产物）；图生/参考模式下若用户已上传图片也可不传 image，系统自动使用最近上传的图片。生成需几分钟，请告知用户耐心等待。\n\
+【重要】严禁回复「我无法生成视频」等话术，也不要只给提示词。需要生成时立即实际发起 generate_video 工具调用，不要在正文里描述「调用 generate_video：…」而不真正调用。",
+        _ => "",
+    };
+    let base = if conv.web_search {
+        format!(
+            "你是 ChatDeepSeek 智能助手。今天是 {date}。\n\
+\n\
+请严格遵循以下工作流程处理用户的每个问题：\n\
+1. 【思考】深入理解用户问题：拆解意图、提取关键信息、判断需要哪些实时信息或专业领域数据；\n\
+2. 【执行】当问题涉及实时信息、专业垂直领域内容，或你无法确定的事实，主动调用 web_search 工具搜索（可针对不同关键词多次搜索；必要时通过 provider 参数指定 tavily 或 anysearch 引擎）。注意：只有真正调用 web_search 工具时，才可向用户说明「正在搜索」；在发出工具调用之前，不要向用户承诺「我去搜索」「让我查一下」之类的话术，直接调用工具即可；\n\
+3. 【分析】综合分析搜索结果与用户问题：交叉验证、去伪存真，提炼与问题直接相关的核心事实与数据；\n\
+4. 【总结】以「总-分-总」结构回答用户：\n\
+   - 总：先给出直接明确的结论或概要，让用户第一时间获得答案；\n\
+   - 分：再分点展开，说明依据、推理过程与关键数据，引用搜索结果时附上来源链接 [来源](url)；\n\
+   - 总：最后总结要点，并适当补充注意事项或建议。\n\
+\n\
+回答请使用规范的 Markdown 格式（标题、列表、表格、加粗等），保持简洁、准确、条理清晰，不要使用 emoji 过度装饰。"
+        )
+    } else {
+        format!(
+            "你是 ChatDeepSeek 智能助手。今天是 {date}。\n\
+\n\
+回答用户问题前请先思考：拆解问题意图、整理回答思路，再组织答案。\n\
+回答采用「总-分-总」结构：先给出结论概要，再分点展开说明依据与细节，最后总结要点。\n\
+请使用规范的 Markdown 格式（标题、列表、表格、加粗等），保持简洁、准确、条理清晰，不要使用 emoji 过度装饰。\n\
+\n\
+【重要：联网搜索未开启】\n\
+当前没有启用联网搜索功能，你无法访问互联网，也无法获取实时信息。\n\
+- 绝对不要说自己「正在搜索」「为你搜索」「稍后查询」「等我查一下」等话术，也不要声称自己具备联网能力；\n\
+- 如果用户询问实时新闻、最新事件、实时行情、今日热点等需要联网才能获取的信息，请如实告知：「当前未开启联网搜索，我无法获取实时信息」，然后基于自身已有知识给出一般性说明、背景分析或建议，并提醒用户可开启消息框中的「联网搜索」后再询问。"
+        )
+    };
+    format!("{base}{mode_hint}")
 }
 
 fn build_outgoing(
@@ -236,6 +313,12 @@ fn build_outgoing(
                 } else {
                     Vec::new()
                 };
+                // 空内容且无工具调用的 assistant 消息（如旧版本停止生成时残留的
+                // 部分思考记录）：重放给 OpenAI 兼容接口会因缺少 content 字段报 400，
+                // 直接跳过（不产生孤儿 tool_result——本分支其余代码一并跳过）
+                if row.content.trim().is_empty() && tool_calls.is_empty() {
+                    continue;
+                }
                 out.push(OutMsg::Assistant {
                     content: row.content.clone(),
                     tool_calls,
@@ -303,6 +386,9 @@ fn persist(state: &AppState, conv: &Conversation, acc: &Accum) -> Result<(), Str
     if state.db.get_conversation(conv.id).is_none() {
         return Ok(());
     }
+    // 停止生成时即使只有思考内容（正文为空）也照常落库：
+    // 用户停止后界面依赖该消息展示已流式输出的思考过程，不落库会导致内容"消失"。
+    // 空 content 消息不会发往 API——build_outgoing / try_compress_history 已将其过滤
     let tool_calls_json = serde_json::to_string(&acc.tool_calls).unwrap_or_else(|_| "[]".into());
     let tool_results_json =
         serde_json::to_string(&acc.tool_results).unwrap_or_else(|_| "[]".into());
@@ -392,6 +478,12 @@ async fn run_agent_inner(
 
         acc.reasoning.push_str(&turn.reasoning);
         acc.content.push_str(&turn.content);
+
+        // 流式中断（网络错误等）：内容已收进 acc，立即以错误收尾，
+        // 由外层 persist 保存部分内容后再报告错误（避免"内容消失"）
+        if let Some(err) = turn.error {
+            return Err(err);
+        }
 
         if turn.tool_calls.is_empty() {
             break;
@@ -528,6 +620,11 @@ async fn try_compress_history(
             "assistant" => {
                 // 摘要输入不携带工具调用：历史 tool_use 块没有配对的
                 // tool_result 会导致 Anthropic/OpenAI 摘要接口返回 400
+                if row.content.trim().is_empty() {
+                    // 空内容消息（如停止生成时的部分思考记录）同样跳过，
+                    // 避免摘要接口因缺少 content 字段报 400
+                    continue;
+                }
                 msgs.push(OutMsg::Assistant {
                     content: row.content.clone(),
                     tool_calls: Vec::new(),

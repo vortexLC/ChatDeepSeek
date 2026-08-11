@@ -611,7 +611,7 @@ fn file_tools() -> Vec<serde_json::Value> {
 fn generate_image_tool() -> serde_json::Value {
     tool_def(
         TOOL_GENERATE_IMAGE,
-        "根据文字描述生成一张图片（AI 绘画）。生成结果自动保存到会话 images 目录。",
+        "根据文字描述生成一张图片（AI 绘画）。当用户要求生成、绘制、设计图片或图像时，必须调用此工具——系统会调用专门的绘图模型完成生成，你无需也无法自己'画'出来，直接调用即可。生成结果自动保存到会话 images 目录。",
         json!({
             "prompt": {"type": "string", "description": "图片描述，越详细越好（主体、场景、风格、光线、构图等）"},
             "image_size": {"type": "string", "enum": ["1024x1024", "960x1280", "768x1024", "720x1440", "720x1280"], "description": "图片尺寸，默认 1024x1024"},
@@ -624,16 +624,17 @@ fn generate_image_tool() -> serde_json::Value {
 fn generate_video_tool() -> serde_json::Value {
     tool_def(
         TOOL_GENERATE_VIDEO,
-        "根据文字描述生成一段短视频（AI 视频生成），生成耗时约几分钟，完成后自动保存到会话 videos 目录。\n\
+        "根据文字描述生成一段短视频（AI 视频生成）。当用户要求生成视频/动画/短片时，必须调用此工具——系统会调用专门的视频模型完成生成，直接调用即可。生成耗时约几分钟，完成后自动保存到会话 videos 目录。\n\
          三种用法（通过 mode 明确指定）：\n\
          1. 文生视频 text2video：只用 prompt 文字描述即可；\n\
          2. 图生视频 image2video：以用户上传的图片（系统会自动获取，无需传 image）或 image 参数（URL / data:image base64）作为起始画面；\n\
          3. 参考图生视频 reference2video：以 images 参数中的一张或多张参考图生成视频（需参考生视频 r2v 模型）。\n\
-         用户明确要求基于某张图/把图片做成视频时，优先使用图生视频 image2video。",
+         用户明确要求基于某张图/把图片做成视频时，优先使用图生视频 image2video。\n\
+         若刚用 generate_image 生成了图片、要基于它生成视频：mode 用 image2video，image 传该图片路径（如 images/xxx.png）。",
         json!({
             "mode": {"type": "string", "enum": ["text2video", "image2video", "reference2video"], "description": "可选：文生视频 / 图生视频 / 参考图生视频；缺省时系统按是否提供图片自动判断"},
             "prompt": {"type": "string", "description": "视频内容描述（画面、动作、镜头运动等）"},
-            "image": {"type": "string", "description": "可选：图生视频的起始图片 URL 或 data:image base64（留空则自动使用用户最近上传的图片）"},
+            "image": {"type": "string", "description": "可选：图生视频的起始图片——可传图片 URL、data:image base64，或本会话内图片路径（如 images/xxx.png，即 generate_image 的产物）；留空则自动使用用户最近上传的图片"},
             "images": {"type": "array", "items": {"type": "string"}, "description": "可选：参考图生视频的参考图片列表（URL / base64）"},
             "image_size": {"type": "string", "enum": ["1280x720", "720x1280", "960x960"], "description": "视频画幅，默认 1280x720"}
         }),

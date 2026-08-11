@@ -56,12 +56,33 @@ pub async fn run(
                     content,
                     tool_calls: Vec::new(),
                     stopped: true,
+                    error: None,
                 });
             }
             chunk = stream.next() => {
                 let bytes = match chunk {
                     Some(Ok(b)) => b,
-                    Some(Err(e)) => return Err(format!("网络错误: {e}")),
+                    Some(Err(e)) => {
+                        // 用户已停止时网络中断属正常：保留已生成内容，按"已停止"收尾
+                        if token.is_cancelled() {
+                            return Ok(TurnResult {
+                                reasoning,
+                                content,
+                                tool_calls: Vec::new(),
+                                stopped: true,
+                                error: None,
+                            });
+                        }
+                        // 流式中断：已生成的内容随错误一并返回，由上层先持久化
+                        // 再报告错误，避免已流式输出的内容随网络错误一起丢失
+                        return Ok(TurnResult {
+                            reasoning,
+                            content,
+                            tool_calls: Vec::new(),
+                            stopped: false,
+                            error: Some(format!("网络错误: {e}")),
+                        });
+                    }
                     None => break,
                 };
                 buf.extend_from_slice(&bytes);
@@ -156,19 +177,27 @@ pub async fn run(
         content,
         tool_calls: tools,
         stopped: false,
+        error: None,
     })
 }
 
 fn build_body(
     model: &ModelConfig,
-    _conv: &Conversation,
+    conv: &Conversation,
     msgs: &[OutMsg],
     tools: &[serde_json::Value],
 ) -> serde_json::Value {
+    let mut messages = build_messages_json(msgs);
+    // 注入系统提示词（与 Anthropic 协议一致）：模式说明、工具使用指引、回答规范。
+    // 缺失时模型不知道当前模式与可用工具，会以"文本模型无法生成"为由拒绝图片/视频生成
+    messages.insert(
+        0,
+        serde_json::json!({ "role": "system", "content": super::build_system_prompt(conv) }),
+    );
     let mut body = serde_json::json!({
         "model": model.name,
         "max_tokens": MAX_TOKENS,
-        "messages": build_messages_json(msgs),
+        "messages": messages,
         "stream": true,
     });
     if !tools.is_empty() {

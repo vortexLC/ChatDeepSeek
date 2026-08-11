@@ -80,6 +80,10 @@ function VideoThumb({
     video.muted = true;
     video.playsInline = true;
     video.preload = "metadata";
+    // 关键：asset 协议（convertFileSrc）与 WebView 页面不同源，默认加载会污染 canvas，
+    // 导致 toDataURL 抛 SecurityError 无法截取首帧；匿名 CORS 加载（Tauri asset 协议
+    // 支持 CORS 响应头）后 canvas 保持干净，方可正常截帧
+    video.crossOrigin = "anonymous";
     let settled = false;
     let timer = 0;
     const done = (v: string | null) => {

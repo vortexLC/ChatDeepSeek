@@ -24,3 +24,6 @@ gitea-git-workflow/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 调研缓存（百炼 API 文档等临时抓取）
+docfetch/

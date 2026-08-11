@@ -265,15 +265,18 @@ export default function App() {
     }
   }, []);
 
-  const reloadMessages = useCallback(async (id: number) => {
+  /** 拉取会话消息。返回是否成功应用：失败时保留当前视图与流式气泡，
+   *  避免已生成的内容从界面消失（可稍后切换会话恢复） */
+  const reloadMessages = useCallback(async (id: number): Promise<boolean> => {
     convReqRef.current = id;
     setLoadingMessages(true);
     try {
       const list = await getMessages(id);
-      if (convReqRef.current !== id) return; // 已切换会话，丢弃过期响应
+      if (convReqRef.current !== id) return false; // 已切换会话，丢弃过期响应
       setMessages(list);
+      return true;
     } catch {
-      if (convReqRef.current === id) setMessages([]);
+      return false;
     } finally {
       if (convReqRef.current === id) setLoadingMessages(false);
     }
@@ -346,14 +349,22 @@ export default function App() {
       });
 
       if (payload.kind === "done") {
-        setDrafts((prev) => {
-          const { [cid]: _removed, ...rest } = prev;
-          return rest;
-        });
+        // 先等持久化内容加载回来再移除流式气泡，避免回复短暂"消失"；
+        // 加载失败时保留气泡（内容仍在界面上，可稍后切换会话恢复）
+        const removeDraft = () => {
+          setDrafts((prev) => {
+            const { [cid]: _removed, ...rest } = prev;
+            return rest;
+          });
+        };
         reloadConversations();
         if (activeIdRef.current === cid) {
-          reloadMessages(cid);
-          refreshContext(cid);
+          reloadMessages(cid).then((ok) => {
+            if (ok) removeDraft();
+            refreshContext(cid);
+          });
+        } else {
+          removeDraft();
         }
       }
     if (payload.kind === "permission_request") {
@@ -391,7 +402,7 @@ export default function App() {
     }
     if (payload.kind === "stopped") {
       // 用户主动停止：非错误。先等持久化的部分内容加载回来，再移除流式气泡，
-      // 避免已生成内容短暂闪现消失
+      // 避免已生成内容短暂闪现消失；加载失败时保留气泡（内容仍在，可稍后恢复）
       const removeDraft = () => {
         setDrafts((prev) => {
           const { [cid]: _removed, ...rest } = prev;
@@ -399,8 +410,8 @@ export default function App() {
         });
       };
       if (activeIdRef.current === cid) {
-        reloadMessages(cid).then(() => {
-          removeDraft();
+        reloadMessages(cid).then((ok) => {
+          if (ok) removeDraft();
           refreshContext(cid);
         });
       } else {
@@ -409,15 +420,23 @@ export default function App() {
     }
     if (payload.kind === "error") {
         // 仅当前活动会话的错误弹横幅；后台会话的错误只清理其 draft，避免误导
+        const removeDraft = () => {
+          setDrafts((prev) => {
+            const { [cid]: _removed, ...rest } = prev;
+            return rest;
+          });
+        };
         if (activeIdRef.current === cid) {
           showError(payload.text ?? "生成失败，请检查 API 配置");
-          reloadMessages(cid);
-          refreshContext(cid);
+          // 先等持久化的部分内容加载回来再移除气泡，避免已生成内容随错误消失；
+          // 加载失败时保留气泡（内容仍在界面上）
+          reloadMessages(cid).then((ok) => {
+            if (ok) removeDraft();
+            refreshContext(cid);
+          });
+        } else {
+          removeDraft();
         }
-        setDrafts((prev) => {
-          const { [cid]: _removed, ...rest } = prev;
-          return rest;
-        });
       }
     },
     [reloadConversations, reloadMessages, refreshContext, showError, pushToast, upsertJob]
@@ -436,6 +455,13 @@ export default function App() {
       setMessages([]);
       setContext(null);
       setEditTarget(null);
+      // 清理该会话残留的流式草稿（如上次 reload 失败时保留的），
+      // 避免与消息列表中已持久化的内容重复展示；若会话仍在生成，
+      // 后续事件会基于 emptyDraft 重新创建草稿，不影响继续流式输出
+      setDrafts((prev) => {
+        const { [id]: _removed, ...rest } = prev;
+        return rest;
+      });
       reloadMessages(id);
       reloadJobs(id);
       refreshContext(id);

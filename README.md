@@ -1,56 +1,89 @@
 # ChatDeepSeek
 
-一款使用 **Tauri v2 + Rust + SQLite + React** 构建的桌面端 AI 对话聊天应用。以「精简、高效、高质量视觉体验」为设计目标，专为与 DeepSeek 等大语言模型的日常对话而打造。
+一款使用 **Tauri v2 + Rust + SQLite + React** 构建的桌面端 AI 对话应用，以「精简、高效、高质量视觉体验」为设计目标，支持多模型服务商、联网搜索、图片/视频生成、隔离沙箱编程工具与异步任务管理，适用于与大语言模型的日常对话与轻量开发协作。
 
 ## 功能特性
 
-- **对话隔离**：每个对话拥有独立、隔离的上下文，互不干扰；对话按「年-月」时间顺序自动分组显示
-- **DeepSeek 双模型**：通过 **Anthropic (Messages API) 协议** 调用 DeepSeek，一个官方 API Key 即可使用 `deepseek-v4-flash` 与 `deepseek-v4-pro` 两个模型；模型在**消息发送框**中随时切换
-- **深度思考模式**：可开关，并按模型选择推理强度
-  - `deepseek-v4-flash`：无 / 低(low) / 高(high) / 最大(max)
-  - `deepseek-v4-pro`：无 / 高(high) / 最大(max)
-- **联网搜索（Function Calling）**：通过 Tool Calls 让模型自主决定是否搜索、搜索什么，无需手动干预
-  - **Tavily**：适合简单日常任务、事实类数据检索，快速轻量
-  - **AnySearch**：适合专业垂直领域内容搜索（财经、医疗、学术、代码、法律等），支持 `tag` 子域能力
-  - 搜索结果以「网页标题 + 链接」小型卡片形式展示，点击卡片直接跳转网页
-  - 支持智能路由：模型可指定 `provider`，未指定时按查询内容自动选择合适引擎
-- **Markdown 渲染**：AI 回复实时渲染 Markdown（代码高亮、表格、列表等），流式输出
-- **精简界面**：
-  - 左侧：对话列表 + 「开启新对话」按钮，底部设置按钮
-  - 右侧：聊天区 + 消息输入栏（**AI 模型选择**、输入框、发送、联网搜索开关、深度思考开关与强度选择、停止生成）
-  - 设置面板：左侧垂直选项卡（通用 / AI 模型 / 搜索服务），**固定面板大小**，切换选项卡时面板尺寸不变
-- **本地数据规整存储**：全部数据保存在项目根目录的 `data/` 文件夹，结构清晰：
-  - `data/json/` —— API Key 与应用设置（`settings.json`）
-  - `data/db/` —— SQLite 数据库（会话上下文记忆）
-  - `data/sessions/` —— 会话数据（每个会话一个 JSON 文件）
-  - 开发模式下位于项目根目录；正式安装运行时若根目录不可写，自动回退至系统应用数据目录
-- **会话项目目录存储**：每个会话对应 `data/sessions/<会话ID>/` 项目目录，保存该会话全部数据：
-  - `session.json` —— 会话元数据（标题/模型/模式/开关）
-  - `messages.db` —— 会话内容（消息/思考链/工具调用/搜索结果/产物索引）
-  - `files/`、`images/`、`videos/` —— 文件、图片、视频产物
-- **五种模式**（发送框左上角模式菜单切换）：
-  - **Chat**：普通对话
-  - **Image**：Chat + 图片生成（硅基流动 Kolors 等）
-  - **Video**：Chat + 视频生成（硅基流动 Wan2.2-T2V/I2V-A14B，文生视频/图生视频）
-  - **Build**：编程工具（read_file/write_file/edit_file/delete_file/list_files/glob/grep + 隔离沙箱 bash），用于简单项目开发，无图片/视频生成
-  - **Agent**：全部工具（编程 + 图片 + 视频 + 联网搜索）
-- **操作系统级沙箱（Agent/Build 模式）**：bash 工具通过 **Windows AppContainer** 运行 —— 会话 `files/` 目录在系统层面（ACL）只授权该会话容器，子进程**无法访问工作区之外的任何文件**（无论命令怎么写，`C:\...`、messages.db 等一律被 OS 拒绝）；文件工具对目录外路径默认拒绝，需用户确认；沙箱初始化失败时拒绝执行（fail-closed）
-- **视频生成后台化**：Video 模式提交视频生成后立即返回，后台轮询（最长 10 分钟），完成自动保存并推送通知，**生成期间会话可继续正常对话**；删除/编辑会话时自动取消后台任务
-- **生成工具（Tool Calls）**：模型可通过 Function Calling 调用编程工具与生成工具；图片/视频生成结果自动保存到会话目录并实时推送到聊天界面，点击产物卡片可在右侧面板预览（图片查看 / 视频播放 / 文件内容 Diff）
-- **右侧面板**：显示链接网页内容、会话文件内容（Diff，随系统深浅色主题自适应）、图片预览与视频播放，右上角图标开关
-- **1M 上下文管理**：模型上下文总量 1M tokens，自动估算各会话用量：
-  - 用量达 **90%** 时提示「建议开启新对话」
-  - 用量**已满**时输入框禁用并提示「上下文已满，请新开会话」，发送消息会被拦截并提示
+### 对话与消息
+
+- **对话隔离**：每个对话拥有独立、隔离的上下文与目录，互不干扰；侧边栏按「年-月」自动分组，支持双击重命名、二次确认删除
+- **多服务商多模型**：可添加任意多个模型服务商（**Anthropic Messages** 或 **OpenAI 兼容**协议），每个服务商可配置多个模型；预置 DeepSeek 官方服务商（`deepseek-v4-flash` / `deepseek-v4-pro`，一个 Key 即可使用）
+- **模型四类分型**：文本（无视觉）/ 多模态（视觉）/ 图片生成 / 视频生成；服务商内每个模型可独立配置上下文容量、视频接口风格（自动 / 硅基流动 / 阿里云百炼），并支持**一键测试连接**
+- **消息框切换模型**：当前对话可在消息框左侧随时切换对话模型（按服务商分组显示）
+- **附件上传**：支持上传图片（PNG/JPEG/GIF/WebP/BMP，需多模态模型）与文档（文本类 + PDF，后端自动提取文本），单文件 ≤ 8MB、单次最多 10 个；SVG 等携带脚本的图片直接拒绝
+- **编辑重发**：编辑已发送的用户消息，删除其后的历史并以新内容重新生成
+- **深度思考模式**：可开关；Anthropic 协议支持推理强度选择（低/高/最大），OpenAI 兼容协议自动读取 `reasoning_content` 流式展示
+- **Markdown 渲染**：AI 回复实时渲染（代码高亮、表格、任务列表等），代码块为**可折叠卡片**（自动从语言标签或首行注释识别文件名），流式输出带光标
+- **流式阶段提示**：思考 →（搜索）→ 分析 → 回答 → 生成，各阶段状态实时切换
+
+### 联网搜索（Function Calling）
+
+- 模型通过 Tool Calls 自主决定是否搜索、搜索什么，无需手动干预
+- **Tavily**：适合简单日常任务、事实类数据检索，快速轻量
+- **AnySearch**：适合专业垂直领域内容搜索（财经、医疗、学术、代码、法律等）
+- **智能路由**：模型可指定 `provider`；未指定时按查询内容关键词自动选择引擎（专业领域 → AnySearch，日常 → Tavily），单引擎无结果时自动切换另一引擎兜底
+- 搜索结果以「网页标题 + 链接」卡片实时推送到聊天界面，点击卡片在**右侧面板**内预览（也可在浏览器中打开）
+- 搜索策略（模型自动 / 始终 Tavily / 始终 AnySearch）与每轮结果数（1-20）可配置
+
+### 五种模式（发送框左上角模式菜单切换）
+
+| 模式 | 说明 |
+| --- | --- |
+| **Chat** | 普通对话 |
+| **Image** | Chat + 图片生成 |
+| **Video** | Chat + 视频生成（文生 / 图生 / 参考生） |
+| **Build** | 编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep + 隔离沙箱 bash），无图片/视频生成 |
+| **Agent** | 全部工具（编程 + 图片 + 视频 + 联网搜索） |
+
+### 图片与视频生成
+
+- **图片生成**：模型调用 `generate_image` 工具（OpenAI 兼容 `images/generations` 接口），支持尺寸、负面提示词，结果自动下载保存到会话 `images/` 目录并实时推送卡片
+- **视频生成后台化**：Video/Agent 模式提交视频生成后立即返回，**后台轮询状态**（硅基流动最长 10 分钟 / 阿里云百炼最长 15 分钟），期间会话可继续正常对话
+  - 三种用法：**文生视频（text2video）**、**图生视频（image2video）**（自动使用用户最近上传的图片作为首帧）、**参考生视频（reference2video）**（需专用 r2v 模型，如阿里云百炼 `wan2.7-r2v` / `wan2.6-r2v`）
+  - 支持两家接口：硅基流动（`/video/submit`）与阿里云百炼 DashScope（`video-synthesis` 原生异步接口，自动兼容多代 wanx / wan 模型请求格式）
+  - 模型不可用（下架/未开通）时自动查询账户可用视频模型并切换重试
+- **异步任务状态追踪**：任务卡片实时展示「生成中（含已等待时间）/ 失败原因」，完成后生成「任务完成」消息（提交时间 + 耗时）并推送右上角通知；侧边栏显示「生成中」徽标；**应用重启后自动恢复未完成任务轮询**；删除/编辑会话时自动取消任务
+- **产物卡片**：图片显示缩略图、视频显示首帧截取 + 播放角标、文件显示名称与大小，点击可在右侧面板预览（图片查看 / 视频播放 / 文件内容）
+
+### 编程工具与操作系统级沙箱（Build / Agent 模式）
+
+- **文件工具**：read_file / write_file / edit_file / delete_file / list_files / glob（支持 `*` `**`）/ grep，工作区为会话 `files/` 目录
+- **bash 沙箱**：命令通过 **Windows AppContainer** 运行 —— 会话 `files/` 目录在系统层面（ACL）仅授权该会话容器，子进程**无法访问工作区之外的任何文件**（无论命令怎么写，`C:\...`、messages.db 等一律被 OS 拒绝）；沙箱初始化失败时拒绝执行（fail-closed）
+- **越界确认**：文件工具/命令尝试访问会话目录之外（绝对路径、`..` 逃逸、盘符/UNC/环境变量路径）时，弹出权限确认对话框（90 秒超时自动拒绝）
+- 命令 60 秒超时终止，输出统一截断保护上下文
+
+### 右侧预览面板
+
+- 点击消息中的链接、搜索卡片、文件产物或图片/视频产物卡片，在右侧面板内预览
+- **网页预览**：后端抓取并**消毒 HTML**（剔除 script/iframe/svg/form 等危险元素与危险协议）后在 sandbox iframe 中渲染；内置 **SSRF 防护**（拒绝内网/回环地址，重定向逐跳复检，含 IPv4-mapped IPv6）
+- **文件预览**：会话目录内文本文件（≤ 2MB），随系统深浅色主题自适应
+- 右上角图标开关面板，预览内容可一键在系统浏览器中打开
+
+### 上下文管理
+
+- 上下文容量按模型配置（设置 → 服务商，千 token，默认 128K），自动估算已用（消息 + 思考链 + 工具调用 + 搜索结果 + 附件）
+- **自动压缩**：用量达到 **60%** 时调用模型将早期对话浓缩为摘要（保留最近 6 条消息），之后仅发送摘要 + 近期消息，长对话可持续使用
+- 用量达 **90%**：提示条「建议开启新对话」（可一键新建或关闭提示）
+- 用量**已满（100%）**：提示条升级、输入框禁用，即使尝试发送也会被后端拦截
+
+### 系统托盘与界面
+
+- **系统托盘**：关闭窗口最小化到托盘（不退出）；托盘左键点击显示主界面，菜单「显示主界面 / 退出」；退出时自动取消所有进行中的任务
+- **界面布局**：左侧对话列表（分组/重命名/删除/生成中徽标）+ 聊天区（消息流 + 输入栏）+ 右侧预览面板
+- **输入栏**：模式菜单、附件上传、模型选择、联网搜索开关、深度思考开关与推理强度、发送/停止
+- **设置面板**：左侧垂直选项卡（通用 / 服务商 / 模型选择 / 搜索服务），固定面板尺寸；主题跟随系统/浅色/深色
+- **通知与提示**：右上角堆叠 Toast（任务提交/完成/失败）、错误横幅、权限确认弹窗
 
 ## 技术栈
 
 | 层 | 技术 |
 | --- | --- |
-| 桌面框架 | Tauri v2（WebView2 / WKWebView / WebKitGTK） |
-| 后端 | Rust（Tokio + reqwest 流式 SSE + rusqlite） |
+| 桌面框架 | Tauri v2（WebView2 / WKWebView / WebKitGTK），含系统托盘 |
+| 后端 | Rust（Tokio + reqwest 流式 SSE + rusqlite bundled） |
 | 前端 | React 18 + TypeScript + Vite |
-| Markdown | marked + DOMPurify + highlight.js |
-| 数据库 | SQLite（rusqlite bundled，无外部依赖） |
+| Markdown | marked + DOMPurify + highlight.js（按需引入常用语言） |
+| 数据库 | SQLite（rusqlite bundled，无外部依赖，WAL 模式） |
+| 安全 | Windows AppContainer 沙箱（windows-sys）、HTML 消毒（scraper）、SSRF 防护、路径规范化 |
 
 ## 项目结构
 
@@ -60,35 +93,54 @@ ChatDeepSeek/
 ├── package.json              # 前端依赖与脚本
 ├── vite.config.ts
 ├── index.html
+├── tsconfig.json
+├── start.bat                 # 一键启动器（环境检查 / 开发 / 打包 菜单）
+├── package.bat               # 一键打包器（便携版 + NSIS 安装包）
+├── scripts/
+│   ├── package-portable.ps1  # 便携版打包（复制 exe 到 dist-portable/）
+│   └── run-release.ps1       # 构建 release 并直接运行
 ├── src/                      # 前端 (React + TS)
 │   ├── main.tsx
 │   ├── App.tsx               # 应用根组件与状态管理
 │   ├── types.ts              # 共享类型定义
-│   ├── api.ts                # Tauri invoke 封装 + 事件监听
+│   ├── api.ts                # Tauri invoke 封装 + chat_event 监听
 │   ├── styles.css            # 全部样式 (CSS Variables, 浅色/深色主题)
 │   ├── lib/
-│   │   └── markdown.ts       # Markdown 渲染 (marked + DOMPurify + hljs)
+│   │   └── markdown.ts       # Markdown 渲染 (marked + DOMPurify + hljs + 代码卡片)
 │   └── components/
 │       ├── icons.tsx         # 内联 SVG 图标集
-│       ├── Sidebar.tsx       # 对话列表 (年月分组) + 新建对话 + 设置入口
-│       ├── ChatView.tsx      # 聊天区 (消息流 + 搜索卡片 + 模型选择)
-│       ├── MessageItem.tsx   # 单条消息 (Markdown 渲染 / 思考折叠块 / 复制)
-│       ├── InputBar.tsx      # 输入栏 (联网/深度思考开关 + 强度选择 + 发送/停止)
-│       └── SettingsPanel.tsx # 设置面板 (左侧垂直选项卡, 固定尺寸)
+│       ├── Sidebar.tsx       # 对话列表 (年月分组 / 重命名 / 删除确认 / 生成中徽标)
+│       ├── ChatView.tsx      # 聊天区 (消息流 + 上下文提示条 + 搜索/产物卡片)
+│       ├── MessageItem.tsx   # 单条消息 (Markdown / 思考折叠 / 复制 / 编辑 / 任务完成横条)
+│       ├── DraftMessage      # 流式消息 (ChatView 内: 状态提示 + 思考 + 搜索卡片 + 产物)
+│       ├── InputBar.tsx      # 输入栏 (模式/模型/附件/联网/深度思考/强度/发送/停止)
+│       ├── SettingsPanel.tsx # 设置面板 (通用 / 服务商 / 模型选择 / 搜索服务)
+│       ├── ArtifactCards.tsx # 产物卡片 (图片缩略图 / 视频首帧 / 文件芯片, LRU 缓存)
+│       ├── JobCard.tsx       # 异步任务卡片 (生成中实时计时 / 失败原因)
+│       ├── Markdown.tsx      # Markdown 容器 (代码折叠 / 链接拦截预览)
+│       ├── WebPreviewPanel.tsx # 右侧预览面板 (网页 / 文件 / 图片 / 视频)
+│       ├── Toast.tsx         # 右上角堆叠通知
 └── src-tauri/                # 后端 (Rust)
     ├── Cargo.toml
     ├── tauri.conf.json
+    ├── build.rs
     ├── capabilities/default.json
     ├── icons/                # 应用图标
     └── src/
         ├── main.rs
-        ├── lib.rs            # Tauri 入口, 命令注册, 全局状态
-        ├── db.rs             # SQLite 初始化 / CRUD / 设置存取
-        ├── models.rs         # 数据结构
+        ├── lib.rs            # Tauri 入口, 命令注册, 托盘, 数据根目录定位
+        ├── commands.rs       # Tauri 命令 (会话/消息/设置/附件/网页抓取/权限应答)
+        ├── db.rs             # SQLite 初始化 / CRUD / 设置存取 / 上下文估算 / 任务表
+        ├── models.rs         # 数据结构 + 服务商/模型解析 + 遗留配置迁移
         ├── llm/
-        │   ├── mod.rs        # 对话主循环 (流式 + 工具调用 + 事件发射)
-        │   ├── anthropic.rs  # Anthropic Messages API 客户端 (调用 DeepSeek)
-        │   └── search.rs     # 联网搜索工具 (Tavily + AnySearch + 智能路由)
+        │   ├── mod.rs        # Agent 主循环 (流式 + 工具调用 + 事件发射 + 上下文压缩)
+        │   ├── anthropic.rs  # Anthropic Messages 协议客户端 (流式 + 思考模式 + 摘要)
+        │   ├── openai.rs     # OpenAI 兼容协议客户端 (流式 + function calling + 摘要)
+        │   └── search.rs     # 联网搜索 (Tavily + AnySearch + 智能路由 + 兜底切换)
+        └── agent/
+            ├── tools.rs      # 工具定义与执行 (文件/glob/grep/bash/搜索/生成)
+            ├── sandbox.rs    # Windows AppContainer 沙箱 (会话级 ACL 隔离)
+            └── generate.rs   # 图片生成 + 视频生成 (硅基流动 / 阿里云百炼, 后台轮询)
 ```
 
 ## 快速开始
@@ -108,65 +160,95 @@ npm install
 npm run tauri dev
 ```
 
+或双击 **`start.bat`**（一键启动器）：自动检查 Node/Rust/WebView2 环境、自动安装依赖，提供菜单：
+
+| 选项 | 说明 |
+| --- | --- |
+| 1. 快速启动 | 构建 release 版并运行（推荐，可避免 Smart App Control 拦截未签名 exe） |
+| 2. 开发模式 | `npm run tauri dev` 热更新调试 |
+| 3. 构建安装包 | NSIS 安装包 |
+| 4. 构建便携版 | 单 exe，输出到 `dist-portable/` |
+
 ### 打包发布
 
 ```bash
 npm run bundle            # 构建安装包（NSIS，安装时可选安装路径）
 npm run bundle:portable   # 构建便携版并复制到 dist-portable/
+npm run dev:release       # 构建 release 版并直接运行（不打包）
 ```
+
+或双击 **`package.bat`**（一键打包器）：自动构建、收集产物到 `dist-portable/`、清理构建中间产物。
 
 产物：
 
 | 产物 | 位置 | 说明 |
 | --- | --- | --- |
 | 便携版 | `dist-portable/ChatDeepSeek.exe` | 单文件免安装，双击即用；运行环境（WebView2，Win10/11 自带）无需下载 |
-| 安装包 | `src-tauri/target/release/bundle/nsis/ChatDeepSeek_0.1.0_x64-setup.exe` | NSIS 安装器，安装时**可选择安装路径**，支持中英文语言选择 |
+| 安装包 | `dist-portable/ChatDeepSeek_0.1.0_x64-setup.exe` | NSIS 安装器，安装时**可选择安装路径**，支持中英文语言选择 |
 
 - **便携版**：`data` 文件夹自动生成在 `ChatDeepSeek.exe` **同目录**
 - **安装版**：`data` 文件夹默认生成在**安装目录**中；安装目录不可写时自动回退系统应用数据目录
 - 应用内嵌前端资源与运行时依赖，用户无需安装 Node.js / Rust 等任何环境
 
-## API 配置
+## 配置指南
 
-在应用内点击左下角 **设置** 按钮，配置以下服务：
+点击左下角 **设置** 按钮，打开设置面板（四个选项卡）。
 
-### 1. AI 模型（DeepSeek API）
+### 1. 通用
+
+- **对话默认**：默认对话模型（在「模型选择」页设置）、新对话默认开启联网搜索 / 深度思考、默认推理强度、默认模式
+- **外观**：主题（跟随系统 / 浅色 / 深色）
+- **数据**：清空所有对话（二次确认，不可恢复）
+
+### 2. 服务商（模型管理）
+
+预置 **DeepSeek 官方** 服务商（Anthropic 协议，`https://api.deepseek.com/anthropic`），也可自由添加任意服务商：
 
 | 配置项 | 说明 |
 | --- | --- |
-| DeepSeek API Key | 从 [DeepSeek Platform](https://platform.deepseek.com/) 获取，**一个 Key 即可使用全部模型** |
+| 名称 | 自定义显示名称 |
+| API 协议 | **OpenAI 兼容**（chat/completions）或 **Anthropic Messages** |
+| API Base URL | 如 `https://api.deepseek.com/anthropic`、`https://api.siliconflow.cn/v1` |
+| API Key | 服务商密钥 |
 
-应用通过 **Anthropic (Messages API) 协议**（`https://api.deepseek.com/anthropic`）调用 DeepSeek 模型。模型 ID 固定为官方 `deepseek-v4-flash` 与 `deepseek-v4-pro`，在**消息发送框左侧**下拉切换，切换后仅对当前对话生效。
+每个服务商下可添加多个模型：
 
-### 2. 联网搜索服务
+- **模型类型**：文本（无视觉）/ 多模态（视觉，支持图片输入）/ 图片生成 / 视频生成
+- **上下文容量**：对话/多模态模型可配置（千 token，默认 128K），决定上下文进度与自动压缩时机
+- **视频接口风格**：视频模型可选 自动 / 硅基流动（`/video/submit`）/ 阿里云百炼（`video-synthesis`）；自动模式按服务商地址与模型名推断
+- **测试**：按类型测试连通性（文本发消息、图片生成测试图、视频验证认证）
+
+> 旧版本（`deepseek` / `gen` 字段配置）的 API Key 与模型会自动迁移为服务商体系。
+
+### 3. 模型选择
+
+为以下用途指定具体模型（服务商 / 模型）：
+
+| 槽位 | 用途 |
+| --- | --- |
+| 对话模型 | 聊天使用；图片输入需选择「多模态」模型 |
+| 图片生成模型 | Image / Agent 模式中生成图片 |
+| 文生视频模型 | Video / Agent 模式中文字生成视频 |
+| 图生视频模型 | 基于图片（作为首帧）生成视频 |
+| 参考生视频模型 | 参考图片 + 提示词生成视频（需 r2v 模型，如阿里云百炼 `wan2.7-r2v` / `wan2.6-r2v`） |
+
+### 4. 搜索服务
 
 | 服务 | 用途 | 获取地址 |
 | --- | --- | --- |
 | Tavily API Key | 日常/简单任务数据搜索 | https://tavily.com |
 | AnySearch API Key | 专业垂直领域深度搜索 | https://www.anysearch.com/console/api-keys |
 
-搜索策略可设置：`模型自动选择 / 始终 Tavily / 始终 AnySearch`。
+搜索策略：`智能自动选择 / 始终 Tavily / 始终 AnySearch`；每轮搜索结果数 1-20（建议 5）。
 
-## 深度思考与推理强度
+### 深度思考与推理强度
 
-依据 [DeepSeek 思考模式文档](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode)，通过 **Anthropic 格式** 参数控制：
+- **Anthropic 协议**（如 DeepSeek）：开启时发送 `thinking.enabled` + `output_config.effort`（`low / high / max`），关闭时显式 `thinking.disabled`（DeepSeek 思考模式默认开启，必须显式关闭）；模型切换到不支持的强度时自动调整
+- **OpenAI 兼容协议**：不发送推理强度参数，模型返回的 `reasoning_content` 自动流式展示为「思考过程」
+- 点击消息框「深度思考」按钮即开/关；开启后按钮旁显示推理强度选项（仅 Anthropic 协议显示，OpenAI 协议隐藏）
+- 思考模式下 `temperature`、`top_p` 等采样参数不生效
 
-- **开启**：`reasoning.effort` + `output_config.effort`（`low / high / max`）
-- **关闭**：`reasoning.effort = "none"`
-
-点击消息框「深度思考」按钮即开/关；开启后按钮旁显示推理强度选项（Flash 支持 低/高/最大，Pro 支持 高/最大），点击即切换。模型切换到 Pro 时，不支持的强度（低/无）会自动调整为「高」。
-
-服务端 effort 映射（来自官方文档，Pro 模型的实际映射 2026 年 8 月初更新）：
-
-| 请求传入 | flash 实际映射 | pro 实际映射 |
-| --- | --- | --- |
-| low | low | high |
-| high | high | high |
-| max | max | max |
-
-> 注意：思考模式下 `temperature`、`top_p` 等采样参数不生效（为兼容已有软件设置参数不会报错）。
-
-## 对话工作流程与阶段提示
+## 对话工作流程
 
 AI 回复采用**流式输出**，并通过 System Prompt 引导模型按照「思考 → 执行 → 分析 → 总结」的流程处理每个问题：
 
@@ -178,8 +260,8 @@ AI 回复采用**流式输出**，并通过 System Prompt 引导模型按照「�
 | 总结 | 以「总-分-总」结构回答：先给结论概要，再分点展开并附来源链接，最后总结要点 | 「正在生成回答…」 |
 
 - 开启「联网搜索」时，模型会被明确要求：需要实时信息或专业内容时**主动搜索**，引用搜索结果时附带来源链接 `[来源](url)`
-- 未开启「联网搜索」时，同样遵循「先思考、再以总-分-总结构组织回答」的规范
-- 阶段提示随流式过程实时切换，搜索到的结果同时以网页卡片形式展示，可点击跳转
+- 未开启「联网搜索」时，模型会被告知无法访问互联网，不会虚构「正在搜索」话术
+- 各模式（Image / Video / Build / Agent）下 System Prompt 附带模式说明，指导工具使用
 
 ## 联网搜索实现说明
 
@@ -190,10 +272,10 @@ web_search(query, provider?, max_results?, search_depth?)
 ```
 
 - `provider`：`auto`（默认）/ `tavily` / `anysearch`，由模型根据问题性质自主选择
-- 智能路由（`auto` 模式）：查询涉及财经、医疗、学术、代码、法律等专业领域关键词时自动路由至 AnySearch；日常简单问题使用 Tavily（缺少任一 Key 时自动降级）
-- AnySearch 支持 `tag` 子域能力（如 `finance.quote`、`code.doc`、`academic.search`），查询命中专业场景时自动附加
-- 搜索过程中，每个结果实时以卡片形式（标题 + 链接 + 摘要）推送至聊天界面，模型最终回答前已可见
-- 多轮工具调用：模型可进行最多 6 轮「思考 → 搜索 → 再回答」循环，思考内容在携带 `tools` 参数时会完整回传给 API（DeepSeek 要求）
+- 智能路由（`auto` 模式）：查询涉及财经、医疗、学术、代码、法律等专业领域关键词时自动路由至 AnySearch；日常简单问题使用 Tavily（缺少任一 Key 时自动降级；首选引擎无结果时自动切换另一引擎）
+- 搜索过程中，每个结果实时以卡片形式（标题 + 链接 + 摘要）推送至聊天界面
+- 多轮工具调用：模型可进行最多 **8 轮**「思考 → 工具调用 → 再回答」循环
+- 模型可调用的工具集由会话模式决定：Chat 仅联网搜索（可关闭）；Image/Video 增加生成工具；Build/Agent 增加文件工具与 bash
 
 ## 数据存储
 
@@ -201,37 +283,34 @@ web_search(query, provider?, max_results?, search_depth?)
 
 ```
 data/
-├── json/          # API Key、应用设置（settings.json）
+├── json/          # 应用设置（settings.json，含 API Key 与服务商配置）
 └── sessions/      # 会话数据：每个会话一个项目目录
     └── <会话ID>/
-        ├── session.json   # 会话元数据
-        ├── messages.db    # 会话内容（消息/搜索数据/产物索引）
+        ├── session.json   # 会话元数据（标题/模型/模式/开关/压缩摘要）
+        ├── messages.db    # 会话内容（消息/思考链/工具调用/搜索结果/产物索引/任务）
         ├── files/         # 文件产物（Build/Agent 模式）
         ├── images/        # 图片产物（Image/Agent 模式）
-        └── videos/        # 视频产物（Video/Agent 模式）
+        ├── videos/        # 视频产物（Video/Agent 模式）
+        └── uploads/       # 用户上传的附件
 ```
 
-## 图片与视频生成
-
-- 在设置面板「图像视频」中配置硅基流动（SiliconFlow）API Key 与模型（模块化设计，后续可扩展其它提供商）
-- **Image 模式**：模型通过 `generate_image` 工具调用 `images/generations` API 生成图片，自动下载保存到会话 `images/` 目录
-- **Video 模式**：模型通过 `generate_video` 工具提交 `video/submit` 并轮询状态，完成后下载保存到会话 `videos/` 目录（文生视频 Wan2.2-T2V-A14B / 图生视频 Wan2.2-I2V-A14B）
-
-## 上下文管理（1M）
-
-- 模型上下文总量 **1,000,000 tokens**，应用按会话估算已用上下文（内容 + 思考链 + 工具调用/搜索结果）
-- 用量达到 **90%**：聊天区显示提示条「当前会话上下文已使用 X%（N / 100.0 万），建议开启新对话」，可一键开启新对话或手动关闭提示
-- 用量**已满（100%）**：提示条升级为「上下文已满」，输入框禁用（占位符提示「上下文已满，请新开会话」），即使尝试发送也会被后端拦截并提示「上下文已满，请新开会话」
+- **原子写入**：session.json 与 settings.json 均采用「临时文件 + 重命名」写入，崩溃不会损坏配置
+- **自动迁移**：旧版单文件 `<会话ID>.json` 自动迁移为会话目录结构
+- 数据目录定位：开发模式在项目根目录 `data/`；生产模式（便携版/安装版）在 **exe 同目录** `data/`，目录不可写时自动回退系统应用数据目录
 
 ## 常见问题
 
-- **如何使用不同模型？** 在消息发送框左侧下拉选择 DeepSeek V4 Flash / DeepSeek V4 Pro，选择仅对当前对话生效
+- **如何使用不同模型？** 设置 → 服务商 中添加服务商与模型，模型选择 中指定用途；当前对话在消息框左侧下拉切换（仅对当前对话生效）
+- **图片上传失败？** 图片输入需要「多模态（视觉）」模型，请在 设置 → 模型选择 中将对话模型切换为多模态模型；SVG 图片因可能携带脚本而被拒绝
 - **搜索无结果？** 确认设置了 Tavily 或 AnySearch 的 API Key，并确认对应服务处于启用状态
-- **深度思考强度选项为何不同？** `deepseek-v4-flash` 支持 低/高/最大，`deepseek-v4-pro` 支持 高/最大，与模型实际支持保持一致
-- **深度思考开启后如何关闭？** 再次点击「深度思考」按钮即可关闭，推理强度仅在开启时显示
+- **深度思考强度选项为何不同？** Anthropic 协议支持 低/高/最大 强度选择；OpenAI 兼容协议不传强度参数（模型自行推理）
 - **提示「上下文已满」怎么办？** 点击提示条上的「开启新对话」按钮，或新建对话即可继续使用
+- **视频生成很慢？** 视频在后台生成（硅基流动最长 10 分钟 / 阿里云百炼最长 15 分钟），生成期间可继续对话；完成后会推送通知；应用重启后任务会自动恢复
+- **bash 命令被拒绝？** 命令若可能访问会话目录之外的文件（盘符/UNC 等）需用户确认；沙箱内子进程在系统层面无法访问工作区外任何文件
+- **Smart App Control 拦截启动？** 使用 `start.bat` 的选项 1（release 构建）运行，或在 Windows 安全中心关闭 Smart App Control
 
 ## 免责声明
 
-- 请遵守 DeepSeek、Tavily、AnySearch 各自的服务条款与速率限制
-- API Key 保存在本地 SQLite 数据库中，请妥善保管您的设备
+- 请遵守 DeepSeek、Tavily、AnySearch、硅基流动、阿里云百炼等服务商各自的服务条款与速率限制
+- API Key 保存在本地 `data/json/settings.json` 中，请妥善保管您的设备与数据目录
+- AI 生成内容仅供参考，请注意甄别信息真实性

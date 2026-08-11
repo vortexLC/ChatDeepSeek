@@ -33,11 +33,21 @@ pub async fn generate_image(
         return Err("generate_image 缺少 prompt 参数".into());
     }
     let image_size = args["image_size"].as_str().unwrap_or("1024x1024");
+    let base = provider.api_base.trim_end_matches('/');
+    // 阿里云百炼（DashScope，*.aliyuncs.com/compatible-mode/v1）兼容模式的
+    // size 参数使用「宽*高」星号格式（如 1024*1024），与 OpenAI 的 1024x1024
+    // 不同，需转换，否则接口报 size 参数非法
+    let is_dashscope = base.to_lowercase().contains("aliyuncs.com");
+    let size_param = if is_dashscope {
+        image_size.replace('x', "*")
+    } else {
+        image_size.to_string()
+    };
 
     let mut body = json!({
         "model": model.name,
         "prompt": prompt,
-        "size": image_size,
+        "size": size_param,
         "n": 1,
     });
     if let Some(n) = args["negative_prompt"].as_str() {
@@ -47,7 +57,6 @@ pub async fn generate_image(
     }
 
     emit(app, session_id, "status", Some("generating"));
-    let base = provider.api_base.trim_end_matches('/');
     let resp = state
         .client
         .post(format!("{base}/images/generations"))
@@ -142,7 +151,12 @@ pub async fn generate_video(
     }
     // 图生视频 / 参考生视频需要图片；文生视频不需要
     let mut image = args["image"].as_str().unwrap_or("").trim().to_string();
-    let extra_images: Vec<String> = args["images"]
+    // 支持使用本会话内已生成/已保存的图片（如 generate_image 产物 images/xxx.png）：
+    // 本地相对路径读取并转 base64，使「先生图、再基于该图生视频」的衔接可用
+    if !image.is_empty() {
+        image = resolve_image_input(state, session_id, &image)?;
+    }
+    let mut extra_images: Vec<String> = args["images"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -151,6 +165,9 @@ pub async fn generate_video(
                 .collect()
         })
         .unwrap_or_default();
+    for img in extra_images.iter_mut() {
+        *img = resolve_image_input(state, session_id, img)?;
+    }
     // 模式：优先显式 mode 参数；缺省时按是否传图推断（兼容旧调用）
     let mode = match args["mode"].as_str().unwrap_or("").trim().to_lowercase().as_str() {
         "image2video" | "i2v" => VIDEO_MODE_I2V,
@@ -241,6 +258,46 @@ fn latest_uploaded_image(state: &AppState, session_id: i64) -> Result<Option<Str
         }
     }
     Ok(None)
+}
+
+/// 解析图片输入为可直接发送给视频 API 的形式：
+/// - http(s) URL / data URL 原样返回；
+/// - 会话内本地相对路径（如 generate_image 产物 images/xxx.png）读取并转 base64 data URL。
+fn resolve_image_input(state: &AppState, session_id: i64, input: &str) -> Result<String, String> {
+    let t = input.trim();
+    if t.is_empty() {
+        return Ok(String::new());
+    }
+    if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("data:") {
+        return Ok(t.to_string());
+    }
+    // 本地相对路径：限制在会话目录内，读取并转 base64
+    let p = state
+        .db
+        .session_abs_path(session_id, t)
+        .ok_or_else(|| format!("图片路径无效（越界）: {t}"))?;
+    if !p.is_file() {
+        return Err(format!("图片文件不存在: {t}"));
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("读取图片失败（{t}）: {e}"))?;
+    if bytes.is_empty() {
+        return Err(format!("图片文件为空: {t}"));
+    }
+    let mime = match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "image/jpeg",
+    };
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
 }
 
 /// 归一化视频画幅：仅 1280x720 / 720x1280 / 960x960 有效（SiliconFlow 枚举值，

@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use futures_util::StreamExt;
 use tauri::AppHandle;
 
@@ -56,12 +54,33 @@ pub async fn run(
                     content,
                     tool_calls: Vec::new(),
                     stopped: true,
+                    error: None,
                 });
             }
             chunk = stream.next() => {
                 let bytes = match chunk {
                     Some(Ok(b)) => b,
-                    Some(Err(e)) => return Err(format!("网络错误: {e}")),
+                    Some(Err(e)) => {
+                        // 用户已停止时网络中断属正常：保留已生成内容，按"已停止"收尾
+                        if token.is_cancelled() {
+                            return Ok(TurnResult {
+                                reasoning,
+                                content,
+                                tool_calls: Vec::new(),
+                                stopped: true,
+                                error: None,
+                            });
+                        }
+                        // 流式中断：已生成的内容随错误一并返回，由上层先持久化
+                        // 再报告错误，避免已流式输出的内容随网络错误一起丢失
+                        return Ok(TurnResult {
+                            reasoning,
+                            content,
+                            tool_calls: Vec::new(),
+                            stopped: false,
+                            error: Some(format!("网络错误: {e}")),
+                        });
+                    }
                     None => break,
                 };
                 buf.extend_from_slice(&bytes);
@@ -167,6 +186,7 @@ pub async fn run(
         content,
         tool_calls: tools,
         stopped: false,
+        error: None,
     })
 }
 
@@ -181,7 +201,7 @@ fn build_body(
         "model": model.name,
         "max_tokens": MAX_TOKENS,
         "messages": build_messages_json(msgs),
-        "system": build_system_prompt(conv),
+        "system": super::build_system_prompt(conv),
         "stream": true,
     });
     if thinking {
@@ -254,66 +274,6 @@ pub async fn summarize(
                 .map(|s| s.to_string())
         })
         .unwrap_or_default())
-}
-
-fn today_cn() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let days = (secs + 8 * 3600) / 86400;
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y}-{m:02}-{d:02}")
-}
-
-fn build_system_prompt(conv: &Conversation) -> String {
-    let date = today_cn();
-    let mode_hint = match conv.mode.as_str() {
-        crate::models::MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件。",
-        crate::models::MODE_AGENT => "\n\n【当前模式：Agent】你可以使用全部工具：编程工具用于项目开发，generate_image 用于生成图片，generate_video 用于生成视频（耗时约几分钟，完成后会告知保存路径）。",
-        crate::models::MODE_IMAGE => "\n\n【当前模式：Image】如果用户要求生成、绘制图片，请调用 generate_image 工具（生成结果会自动保存）。",
-        crate::models::MODE_VIDEO => "\n\n【当前模式：Video】如果用户要求生成视频，请调用 generate_video 工具，并按需求选择 mode：text2video 文生视频（无需图片）；image2video 图生视频（图片作首帧）；reference2video 参考视频生成（参考图片风格/主体）。图生/参考模式下若用户已在对话中上传图片可不传 image，系统自动使用最近上传的图片。生成需几分钟，请告知用户耐心等待。",
-        _ => "",
-    };
-    let base = if conv.web_search {
-        format!(
-            "你是 ChatDeepSeek 智能助手。今天是 {date}。\n\
-\n\
-请严格遵循以下工作流程处理用户的每个问题：\n\
-1. 【思考】深入理解用户问题：拆解意图、提取关键信息、判断需要哪些实时信息或专业领域数据；\n\
-2. 【执行】当问题涉及实时信息、专业垂直领域内容，或你无法确定的事实，主动调用 web_search 工具搜索（可针对不同关键词多次搜索；必要时通过 provider 参数指定 tavily 或 anysearch 引擎）。注意：只有真正调用 web_search 工具时，才可向用户说明「正在搜索」；在发出工具调用之前，不要向用户承诺「我去搜索」「让我查一下」之类的话术，直接调用工具即可；\n\
-3. 【分析】综合分析搜索结果与用户问题：交叉验证、去伪存真，提炼与问题直接相关的核心事实与数据；\n\
-4. 【总结】以「总-分-总」结构回答用户：\n\
-   - 总：先给出直接明确的结论或概要，让用户第一时间获得答案；\n\
-   - 分：再分点展开，说明依据、推理过程与关键数据，引用搜索结果时附上来源链接 [来源](url)；\n\
-   - 总：最后总结要点，并适当补充注意事项或建议。\n\
-\n\
-回答请使用规范的 Markdown 格式（标题、列表、表格、加粗等），保持简洁、准确、条理清晰，不要使用 emoji 过度装饰。"
-        )
-    } else {
-        format!(
-            "你是 ChatDeepSeek 智能助手。今天是 {date}。\n\
-\n\
-回答用户问题前请先思考：拆解问题意图、整理回答思路，再组织答案。\n\
-回答采用「总-分-总」结构：先给出结论概要，再分点展开说明依据与细节，最后总结要点。\n\
-请使用规范的 Markdown 格式（标题、列表、表格、加粗等），保持简洁、准确、条理清晰，不要使用 emoji 过度装饰。\n\
-\n\
-【重要：联网搜索未开启】\n\
-当前没有启用联网搜索功能，你无法访问互联网，也无法获取实时信息。\n\
-- 绝对不要说自己「正在搜索」「为你搜索」「稍后查询」「等我查一下」等话术，也不要声称自己具备联网能力；\n\
-- 如果用户询问实时新闻、最新事件、实时行情、今日热点等需要联网才能获取的信息，请如实告知：「当前未开启联网搜索，我无法获取实时信息」，然后基于自身已有知识给出一般性说明、背景分析或建议，并提醒用户可开启消息框中的「联网搜索」后再询问。"
-        )
-    };
-    format!("{base}{mode_hint}")
 }
 
 fn build_messages_json(msgs: &[OutMsg]) -> Vec<serde_json::Value> {
