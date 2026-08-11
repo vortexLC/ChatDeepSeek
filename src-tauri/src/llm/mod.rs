@@ -168,20 +168,19 @@ fn today_cn() -> String {
 pub(crate) fn build_system_prompt(conv: &Conversation) -> String {
     let date = today_cn();
     let mode_hint = match conv.mode.as_str() {
-        MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件（访问越界需用户确认）。若你的实现确实无法发起函数调用，请直接输出 JSON 形式的工具参数（如 {\"path\": \"src/main.rs\", \"content\": \"...\"}、{\"path\": \"a.txt\"}、{\"command\": \"dir\"}），系统会自动识别并执行。",
+        MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件（访问越界需用户确认）。必须通过函数调用机制调用工具，工具参数不要写在回复正文中（不要输出 JSON 参数）。",
         MODE_AGENT => "\n\n【当前模式：Agent】你拥有以下全部工具能力：\n\
 1. 编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）：在本会话隔离目录中读写文件、执行命令，完成开发任务；\n\
 2. generate_image：生成图片。当用户要求生成、绘制、设计图片/图像/插画/海报/壁纸等任何视觉内容时，必须调用此工具——系统会调用专门的绘图模型完成生成并自动保存；\n\
 3. generate_video：生成视频。当用户要求生成视频/动画/短片时，必须调用此工具（耗时约几分钟）。\n\
 【重要】\n\
 - 你确实具备图片与视频生成能力（由上述工具调用专门模型实现）。严禁回复「我无法生成图片/视频」「作为文本/语言模型我不能…」「你可以把提示词复制到 Midjourney / Stable Diffusion / Runway / 可灵等工具中」之类的话术。\n\
-- 需要生成时，立即实际发起对应工具调用。严禁只在回复正文里描述或罗列「调用 generate_image：prompt: …」这类文字而不真正调用工具；也严禁只说「正在为您生成」却不发起调用。调用工具前不要输出冗长的计划、分镜脚本或提示词设计。\n\
-- 若你的实现确实无法发起函数调用，请直接输出 JSON 形式的工具参数（generate_image 如 {\"prompt\": \"...\"}；generate_video 如 {\"mode\": \"text2video\", \"prompt\": \"...\"}），系统会自动识别并执行。\n\
+- 需要生成时，立即实际发起对应工具调用。工具参数不要写在回复正文中——严禁输出 JSON 提示词，或描述「调用 generate_image：prompt: …」这类文字而不真正调用；也严禁只说「正在为您生成」却不发起调用。调用工具前不要输出冗长的计划、分镜脚本或提示词设计。\n\
 - 用户要求「先生成图片、再基于该图生成视频」时：先调用 generate_image，等拿到图片结果（含 images/xxx.png 路径）后，再调用 generate_video（mode=image2video，image 传刚生成的图片路径 images/xxx.png）。",
         MODE_IMAGE => "\n\n【当前模式：Image】你具备图片生成能力：当用户要求生成、绘制、设计任何图片/图像/插画/海报/壁纸等视觉内容时，必须调用 generate_image 工具——系统会调用专门的绘图模型完成生成并自动保存。\n\
-【重要】严禁回复「我无法生成图片」「作为文本模型我不能画图」「请去 Midjourney / Stable Diffusion 等外部工具」等话术，也不要只输出提示词。需要生成时立即实际发起 generate_image 工具调用，不要在正文里描述「调用 generate_image：…」而不真正调用。若你的实现确实无法发起函数调用，请直接输出 JSON 形式的参数（如 {\"prompt\": \"...\"}），系统会自动识别并执行。",
+【重要】严禁回复「我无法生成图片」「作为文本模型我不能画图」「请去 Midjourney / Stable Diffusion 等外部工具」等话术，也不要只输出提示词。必须通过函数调用机制调用 generate_image 工具，工具参数不要写在回复正文中（不要输出 JSON 提示词）。",
         MODE_VIDEO => "\n\n【当前模式：Video】你具备视频生成能力：当用户要求生成视频/动画/短片时，必须调用 generate_video 工具，并按需选择 mode：text2video 文生视频（无需图片）；image2video 图生视频（图片作首帧）；reference2video 参考图生视频（参考图片风格/主体，需 r2v 模型）。image/images 可传图片 URL、base64 或本会话内图片路径（如 images/xxx.png，即 generate_image 的产物）；图生/参考模式下若用户已上传图片也可不传 image，系统自动使用最近上传的图片。生成需几分钟，请告知用户耐心等待。\n\
-【重要】严禁回复「我无法生成视频」等话术，也不要只给提示词。需要生成时立即实际发起 generate_video 工具调用，不要在正文里描述「调用 generate_video：…」而不真正调用。若你的实现确实无法发起函数调用，请直接输出 JSON 形式的参数（如 {\"mode\": \"text2video\", \"prompt\": \"...\"}），系统会自动识别并执行。",
+【重要】严禁回复「我无法生成视频」等话术，也不要只给提示词。必须通过函数调用机制调用 generate_video 工具，工具参数不要写在回复正文中（不要输出 JSON 提示词）。",
         _ => "",
     };
     let base = if conv.web_search {
@@ -605,28 +604,50 @@ fn is_permission_error(e: &str) -> bool {
         || e.starts_with("权限确认已失效")
 }
 
-/// 从模型文本回复中识别"文本形式的工具调用"（兼容不支持 function calling 的模型）。
-/// 仅当内容整体是合法 JSON 对象且包含工具特征字段时返回 (工具名, 参数 JSON)。
-/// 生成工具：
-/// - 含 prompt 且（含 mode/image/images 或 Video 模式）→ generate_video
-/// - 含 prompt 且 Image / Agent 模式 → generate_image
-/// 文件工具（Build / Agent 模式）：
-/// - 含 command → bash；含 old_string → edit_file
-/// - 含 path + content → write_file；仅含 path → read_file（只读安全）
-/// - 含 pattern → grep；含 dir → list_files
-/// 避免误判：非 JSON、无特征字段、或非对应模式一律返回 None
+/// 从模型文本回复中识别"文本形式的工具调用"（兼容不支持 function calling、
+/// 或把工具参数写进正文的模型）。识别优先级：
+/// 1. 整体即 JSON 对象；
+/// 2. 正文中的 ```json / ``` 代码块；
+/// 3. 正文中第一个 { 到最后一个 } 的 JSON 片段（如"### 总…系统正在根据以下
+///    参数为您绘制图像：\n```json\n{"prompt": "..."}```"）。
+/// 仅当提取的 JSON 对象含工具特征字段时返回 (工具名, 参数 JSON)。
 fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_json::Value)> {
     let trimmed = content.trim();
-    // 允许 ```json ... ``` 代码块包裹
-    let json_str = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .map(|s| s.strip_suffix("```").unwrap_or(s))
-        .map(|s| s.trim())
-        .unwrap_or(trimmed);
-    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let obj = v.as_object()?;
+    // 收集候选 JSON 片段：整体 → 代码块 → {…} 提取
+    let mut candidates: Vec<&str> = Vec::new();
+    candidates.push(trimmed);
+    if let Some(start) = trimmed.find("```") {
+        let after = &trimmed[start + 3..];
+        if let Some(end) = after.find("```") {
+            let mut block = after[..end].trim();
+            // 去掉代码块语言标记（```json 后的 "json"）
+            if let Some(rest) = block.strip_prefix("json").or_else(|| block.strip_prefix("JSON")) {
+                block = rest.trim();
+            }
+            candidates.push(block);
+        }
+    }
+    if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if close > open {
+            candidates.push(&trimmed[open..=close]);
+        }
+    }
+    for cand in candidates {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
+            if let Some(r) = classify_textual_tool_call(&v, mode) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
 
+/// 按工具特征字段分类 JSON 对象 → (工具名, 参数 JSON)
+fn classify_textual_tool_call(
+    v: &serde_json::Value,
+    mode: &str,
+) -> Option<(String, serde_json::Value)> {
+    let obj = v.as_object()?;
     // ---- 生成工具 ----
     if let Some(prompt) = obj.get("prompt").and_then(|p| p.as_str()) {
         if !prompt.trim().is_empty() {
@@ -635,36 +656,35 @@ fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_j
                 || obj.contains_key("images")
                 || mode == MODE_VIDEO;
             if video_hint {
-                return Some((tools::TOOL_GENERATE_VIDEO.to_string(), v));
+                return Some((tools::TOOL_GENERATE_VIDEO.to_string(), v.clone()));
             }
             if mode == MODE_IMAGE || mode == MODE_AGENT {
-                return Some((tools::TOOL_GENERATE_IMAGE.to_string(), v));
+                return Some((tools::TOOL_GENERATE_IMAGE.to_string(), v.clone()));
             }
         }
     }
-
     // ---- 文件工具（Build / Agent）----
     if mode == MODE_BUILD || mode == MODE_AGENT {
         if obj.contains_key("command") {
-            return Some((tools::TOOL_BASH.to_string(), v));
+            return Some((tools::TOOL_BASH.to_string(), v.clone()));
         }
         if let Some(path) = obj.get("path").and_then(|p| p.as_str()) {
             if !path.trim().is_empty() {
                 if obj.contains_key("old_string") {
-                    return Some((tools::TOOL_EDIT_FILE.to_string(), v));
+                    return Some((tools::TOOL_EDIT_FILE.to_string(), v.clone()));
                 }
                 if obj.contains_key("content") {
-                    return Some((tools::TOOL_WRITE_FILE.to_string(), v));
+                    return Some((tools::TOOL_WRITE_FILE.to_string(), v.clone()));
                 }
                 // 仅 path：只读安全，按 read_file 处理
-                return Some((tools::TOOL_READ_FILE.to_string(), v));
+                return Some((tools::TOOL_READ_FILE.to_string(), v.clone()));
             }
         }
         if obj.contains_key("pattern") {
-            return Some((tools::TOOL_GREP.to_string(), v));
+            return Some((tools::TOOL_GREP.to_string(), v.clone()));
         }
         if obj.contains_key("dir") {
-            return Some((tools::TOOL_LIST_FILES.to_string(), v));
+            return Some((tools::TOOL_LIST_FILES.to_string(), v.clone()));
         }
     }
     None
@@ -818,6 +838,26 @@ mod tests {
         // 代码块包裹同样识别
         let r = parse_textual_tool_call("```json\n{\"prompt\": \"狗\"}\n```", MODE_IMAGE);
         assert!(r.is_some());
+
+        // 文字 + 代码块 JSON（模型把工具参数写进正文的典型场景）
+        let reply = "### 总\n已为您构思并生成一张图片…\n系统正在根据以下参数为您绘制图像：\n```json\n{\"prompt\": \"一只猫\"}\n```";
+        let r = parse_textual_tool_call(reply, MODE_IMAGE);
+        assert!(r.is_some());
+        let (name, args) = r.unwrap();
+        assert_eq!(name, tools::TOOL_GENERATE_IMAGE);
+        assert_eq!(args["prompt"], "一只猫");
+
+        // 文字中直接内嵌 JSON（无代码块）同样识别
+        let reply = "好的，正在为您生成：{\"prompt\": \"一只狗\", \"image_size\": \"1024x1024\"}";
+        let r = parse_textual_tool_call(reply, MODE_IMAGE);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().1["image_size"], "1024x1024");
+
+        // 正文包含多个 JSON 片段时优先取代码块
+        let reply = "参考 {\"a\": 1}，生成：```json\n{\"prompt\": \"猫\"}\n```";
+        let r = parse_textual_tool_call(reply, MODE_IMAGE);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().1["prompt"], "猫");
 
         // 含 mode 字段 → generate_video
         let r = parse_textual_tool_call(r#"{"mode": "text2video", "prompt": "视频"}"#, MODE_IMAGE);
