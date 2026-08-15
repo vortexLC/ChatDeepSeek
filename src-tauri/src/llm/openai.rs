@@ -21,7 +21,9 @@ pub async fn run(
     let base = provider.api_base.trim_end_matches('/');
     let url = format!("{base}/chat/completions");
 
-    let body = build_body(model, conv, msgs, tools);
+    // 系统提示词只构建一次（多轮工具循环 / 400 重试均复用，避免重复格式化开销）
+    let system_prompt = super::build_system_prompt(conv);
+    let body = build_body(model, &system_prompt, msgs, tools);
     // 初始请求（建立流式连接）加超时：服务端挂起时避免任务永久卡死、
     // 停止按钮失效（此时还未进入可取消的流式循环）
     let mut resp = tokio::time::timeout(
@@ -33,9 +35,14 @@ pub async fn run(
 
     if resp.status() == 400 {
         // 部分服务不支持工具参数（如纯视觉模型），收到 400 时去掉工具重试一次
-        // （先消费响应体再重试，避免连接复用被破坏）
-        let _ = resp.text().await;
-        let body2 = build_body(model, conv, msgs, &[]);
+        // （先消费响应体再重试，避免连接复用被破坏）。
+        // 400 原因写入日志：此前的静默降级会让"工具从未送达模型"难以排查
+        let text = resp.text().await.unwrap_or_default();
+        log::warn!(
+            "[api] OpenAI 兼容协议首次请求 400，去掉工具后重试：{}",
+            text.chars().take(300).collect::<String>()
+        );
+        let body2 = build_body(model, &system_prompt, msgs, &[]);
         resp = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             send_request(state, &url, &provider.api_key, &body2),
@@ -122,11 +129,20 @@ pub async fn run(
                     }
                 };
                 buf.extend_from_slice(&bytes);
-                loop {
-                    let Some(pos) = buf.iter().position(|&b| b == b'\n') else { break };
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&line);
+
+                // ---- SSE 增量解析 ----
+                // 1) 游标扫描：每行只前进游标，一个网络 chunk 结束后统一 drain 一次
+                //    （此前逐行 drain，每行一次 O(n) 内存搬移）
+                // 2) 批量推送：同一 chunk 内的 content / reasoning 增量分别合并为
+                //    一次 IPC 事件（此前每 token 一次事件，前端为追加语义，合并不影响展示）
+                let mut scan = 0usize;
+                let mut batch_content = String::new();
+                let mut batch_reasoning = String::new();
+                while let Some(rel) = buf[scan..].iter().position(|&b| b == b'\n') {
+                    let line_end = scan + rel;
+                    let line = String::from_utf8_lossy(&buf[scan..line_end]);
                     let line = line.trim();
+                    scan = line_end + 1;
                     if line == "data: [DONE]" {
                         finished = true;
                         break;
@@ -151,17 +167,13 @@ pub async fn run(
                     };
                     if let Some(t) = delta.get("content").and_then(|x| x.as_str()) {
                         if !t.is_empty() {
-                            if !content_started {
-                                content_started = true;
-                                emit(app, conv.id, "status", Some("answering"));
-                            }
-                            emit(app, conv.id, "content_delta", Some(t));
+                            batch_content.push_str(t);
                             content.push_str(t);
                         }
                     }
                     if let Some(t) = delta.get("reasoning_content").and_then(|x| x.as_str()) {
                         if !t.is_empty() {
-                            emit(app, conv.id, "reasoning_delta", Some(t));
+                            batch_reasoning.push_str(t);
                             reasoning.push_str(t);
                         }
                     }
@@ -182,6 +194,19 @@ pub async fn run(
                             }
                         }
                     }
+                }
+                // 移除已解析部分（一次内存搬移），未完成的尾行留给下个 chunk 拼接
+                buf.drain(..scan);
+
+                if !batch_reasoning.is_empty() {
+                    emit(app, conv.id, "reasoning_delta", Some(&batch_reasoning));
+                }
+                if !batch_content.is_empty() {
+                    if !content_started {
+                        content_started = true;
+                        emit(app, conv.id, "status", Some("answering"));
+                    }
+                    emit(app, conv.id, "content_delta", Some(&batch_content));
                 }
                 if finished {
                     break;
@@ -219,16 +244,16 @@ pub async fn run(
 
 fn build_body(
     model: &ModelConfig,
-    conv: &Conversation,
+    system_prompt: &str,
     msgs: &[OutMsg],
     tools: &[serde_json::Value],
 ) -> serde_json::Value {
     let mut messages = build_messages_json(msgs);
-    // 注入系统提示词（与 Anthropic 协议一致）：模式说明、工具使用指引、回答规范。
-    // 缺失时模型不知道当前模式与可用工具，会以"文本模型无法生成"为由拒绝图片/视频生成
+    // 注入系统提示词：模式说明、工具使用指引、回答规范。
+    // 缺失时模型不知道当前模式与可用工具，会以"文本模型无法生成"为由拒绝图片生成
     messages.insert(
         0,
-        serde_json::json!({ "role": "system", "content": super::build_system_prompt(conv) }),
+        serde_json::json!({ "role": "system", "content": system_prompt }),
     );
     let mut body = serde_json::json!({
         "model": model.name,
@@ -251,7 +276,11 @@ fn build_body(
             })
             .collect();
         body["tools"] = serde_json::Value::Array(openai_tools);
-        body["tool_choice"] = serde_json::json!({"type": "auto"});
+        // 用字符串形式 "auto"（OpenAI 官方文档允许），而非对象形式 {"type": "auto"}：
+        // 阿里云 MaaS 等兼容端点不接受对象形式（报 invalid_parameter_error:
+        // Expected field `function` in `tool_choice`），导致整个请求 400 被降级重试、
+        // 工具被静默移除，模型只能用文本 JSON 兜底调用
+        body["tool_choice"] = serde_json::json!("auto");
     }
     body
 }

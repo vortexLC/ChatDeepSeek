@@ -1,41 +1,36 @@
 use serde::{Deserialize, Serialize};
 
 // ==================== 会话模式 ====================
-/// chat=普通对话 / image=Chat+图片生成 / video=Chat+视频生成
-/// build=编程工具(沙箱, 无生成) / agent=全部工具
+/// chat=普通对话+图片生成 / agent=编程工具+联网搜索+图片生成
 pub const MODE_CHAT: &str = "chat";
-pub const MODE_IMAGE: &str = "image";
-pub const MODE_VIDEO: &str = "video";
-pub const MODE_BUILD: &str = "build";
 pub const MODE_AGENT: &str = "agent";
 
 // ==================== 协议 / 模型类型 ====================
 pub const PROTOCOL_OPENAI: &str = "openai";
-pub const PROTOCOL_ANTHROPIC: &str = "anthropic";
 
 pub const MODEL_TYPE_TEXT: &str = "text";
 pub const MODEL_TYPE_VISION: &str = "vision";
 pub const MODEL_TYPE_IMAGE: &str = "image";
-pub const MODEL_TYPE_VIDEO: &str = "video";
-
-// ==================== 视频生成服务商 ====================
-pub const VIDEO_API_AUTO: &str = "auto";
-pub const VIDEO_API_SILICONFLOW: &str = "siliconflow";
-pub const VIDEO_API_DASHSCOPE: &str = "dashscope";
-
-pub const VIDEO_MODE_T2V: &str = "t2v";
-pub const VIDEO_MODE_I2V: &str = "i2v";
-pub const VIDEO_MODE_R2V: &str = "r2v";
 
 // ==================== 上下文用量 ====================
 /// 未配置模型时的默认上下文容量（token 数）
 pub const CONTEXT_DEFAULT_TOKENS: u64 = 131_072;
 /// 上下文自动压缩触发阈值（用量占比达到该值后尝试摘要早期对话）
 pub const CONTEXT_COMPRESS_THRESHOLD: f64 = 0.6;
-/// 压缩时保留的最近消息条数
-pub const CONTEXT_KEEP_LAST_MSGS: usize = 6;
+/// 压缩后至少保留的最近消息条数（用户 + 助手回复各一条）
+pub const CONTEXT_KEEP_LAST_MSGS: usize = 2;
+/// 压缩保留窗口的 token 预算占比：最近消息累计用量达到
+/// 总容量 × 该比例后，更早的消息进入摘要。按 token 而非固定条数
+/// 保留——Agent 单条消息可含 16 轮工具结果（上万 token），固定条数
+/// 会导致"已压缩但仍超限"
+pub const CONTEXT_KEEP_BUDGET_RATIO: f64 = 0.4;
 /// 每张图片附件占用的估算 token 数
 pub const CONTEXT_IMAGE_TOKENS: u64 = 1_000;
+/// 请求固定开销估算（system prompt + 工具 JSON 定义）：
+/// Agent 模式带全套工具定义约 4k，Chat 模式仅 system 约 1k。
+/// 计入用量估算避免压缩触发偏晚
+pub const CONTEXT_OVERHEAD_AGENT: u64 = 4_000;
+pub const CONTEXT_OVERHEAD_CHAT: u64 = 1_000;
 
 // ==================== 模型提供商 ====================
 
@@ -43,10 +38,8 @@ pub const CONTEXT_IMAGE_TOKENS: u64 = 1_000;
 pub struct ModelConfig {
     pub id: String,
     pub name: String,
-    /// text | vision | image | video
+    /// text | vision | image
     pub model_type: String,
-    /// auto | siliconflow | dashscope
-    pub video_api: String,
     pub context_tokens: u64,
 }
 
@@ -54,7 +47,7 @@ pub struct ModelConfig {
 pub struct ProviderConfig {
     pub id: String,
     pub name: String,
-    /// openai | anthropic
+    /// openai
     pub protocol: String,
     pub api_base: String,
     pub api_key: String,
@@ -116,10 +109,10 @@ fn default_mode() -> String {
 
 // ==================== 消息与产物 ====================
 
-/// 工具生成的文件产物（图片/视频/文件），随消息持久化并展示在聊天界面
+/// 工具生成的文件产物（图片/文件），随消息持久化并展示在聊天界面
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Artifact {
-    /// image | video | file
+    /// image | file
     pub kind: String,
     pub name: String,
     /// 会话目录内相对路径
@@ -140,32 +133,26 @@ pub struct Message {
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
-    /// 关联的异步生成任务 id（视频提交/完成消息），无则为 None
+    /// 执行时间线：思考与各次工具调用按发生顺序记录，前端按时间线层级展示
     #[serde(default)]
-    pub job_id: Option<i64>,
+    pub steps: Vec<ToolStep>,
     pub created_at: i64,
 }
 
-/// 异步生成任务（如视频）：提交后记录，后台轮询完成/失败后更新，
-/// 前端据此展示"提交中 → 完成/失败"的明确状态
+/// 执行时间线中的一个步骤（深度思考 / 工具调用），随消息持久化
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Job {
-    pub id: i64,
-    pub conversation_id: i64,
-    /// video | image
+pub struct ToolStep {
+    /// reasoning | search | tool | image
     pub kind: String,
-    /// 生成服务商：siliconflow | dashscope
-    pub api: String,
-    pub model: String,
-    /// 服务商侧任务 id（requestId / task_id），用于重启后恢复轮询
-    pub request_id: String,
-    /// pending | done | failed | canceled
-    pub status: String,
-    pub submitted_at: i64,
-    pub finished_at: i64,
-    pub error: String,
-    /// 完成后的产物（图片/视频）
-    pub artifact: Option<Artifact>,
+    /// 展示摘要（如：联网搜索 "DeepSeek R1"、读取文件 main.rs、执行命令 npm test）
+    pub label: String,
+    /// 工具名（kind=reasoning 时为空）
+    pub tool: String,
+    /// 耗时（毫秒）
+    pub duration_ms: u64,
+    /// 仅 search 步骤携带：来源列表，点击步骤展开查看
+    #[serde(default)]
+    pub items: Vec<SearchItem>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -202,8 +189,7 @@ pub struct DbMessageRow {
     pub search_results: String,
     pub artifacts: String,
     pub attachments: String,
-    #[serde(default)]
-    pub job_id: Option<i64>,
+    pub steps: String,
     pub created_at: i64,
 }
 
@@ -231,7 +217,7 @@ pub struct SearchSettings {
     pub max_results: i64,
 }
 
-/// 硅基流动生成服务配置
+/// 硅基流动生成服务配置（遗留兼容，新配置统一走 providers 体系）
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct SiliconFlowGenSettings {
     #[serde(default)]
@@ -240,29 +226,21 @@ pub struct SiliconFlowGenSettings {
     pub base_url: String,
     #[serde(default = "default_sf_image_model")]
     pub image_model: String,
-    #[serde(default = "default_sf_video_i2v")]
-    pub video_model_i2v: String,
-    #[serde(default = "default_sf_video_t2v")]
-    pub video_model_t2v: String,
 }
 
-/// 阿里云百炼（DashScope）生成服务配置
+/// 阿里云百炼（DashScope）生成服务配置（遗留兼容）
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AlibabaGenSettings {
     #[serde(default)]
     pub api_key: String,
-    /// OpenAI 兼容模式地址，视频使用其原生异步接口
+    /// OpenAI 兼容模式地址
     #[serde(default = "default_ali_base_url")]
     pub base_url: String,
     #[serde(default = "default_ali_image_model")]
     pub image_model: String,
-    #[serde(default)]
-    pub video_model_i2v: String,
-    #[serde(default)]
-    pub video_model_t2v: String,
 }
 
-/// 生成服务设置（provider: siliconflow / alibaba）
+/// 生成服务设置（provider: siliconflow / alibaba）——遗留兼容字段
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct GenSettings {
     #[serde(default)]
@@ -279,14 +257,6 @@ fn default_sf_base_url() -> String {
 
 fn default_sf_image_model() -> String {
     "Kwai-Kolors/Kolors".into()
-}
-
-fn default_sf_video_i2v() -> String {
-    "Wan-AI/Wan2.2-I2V-A14B".into()
-}
-
-fn default_sf_video_t2v() -> String {
-    "Wan-AI/Wan2.2-T2V-A14B".into()
 }
 
 fn default_ali_base_url() -> String {
@@ -320,17 +290,11 @@ pub struct AppSettings {
     /// 模型提供商列表（用户自定义名称与 API）
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
-    /// 对话模型 / 图片 / 文生视频 / 图生视频 / 参考生视频 的选择
+    /// 对话模型 / 图片 的选择
     #[serde(default)]
     pub chat_model: Option<ModelSelection>,
     #[serde(default)]
     pub image_model: Option<ModelSelection>,
-    #[serde(default)]
-    pub video_model_t2v: Option<ModelSelection>,
-    #[serde(default)]
-    pub video_model_i2v: Option<ModelSelection>,
-    #[serde(default)]
-    pub video_model_r2v: Option<ModelSelection>,
 }
 
 impl Default for AppSettings {
@@ -359,23 +323,16 @@ impl Default for AppSettings {
                     api_key: String::new(),
                     base_url: default_sf_base_url(),
                     image_model: default_sf_image_model(),
-                    video_model_i2v: default_sf_video_i2v(),
-                    video_model_t2v: default_sf_video_t2v(),
                 },
                 alibaba: AlibabaGenSettings {
                     api_key: String::new(),
                     base_url: default_ali_base_url(),
                     image_model: default_ali_image_model(),
-                    video_model_i2v: String::new(),
-                    video_model_t2v: String::new(),
                 },
             },
             providers: Vec::new(),
             chat_model: None,
             image_model: None,
-            video_model_t2v: None,
-            video_model_i2v: None,
-            video_model_r2v: None,
         }
     }
 }
@@ -414,18 +371,6 @@ impl AppSettings {
             .collect()
     }
 
-    pub fn video_models(&self) -> Vec<(&ProviderConfig, &ModelConfig)> {
-        self.providers
-            .iter()
-            .flat_map(|p| {
-                p.models
-                    .iter()
-                    .filter(|m| m.model_type == MODEL_TYPE_VIDEO)
-                    .map(move |m| (p, m))
-            })
-            .collect()
-    }
-
     /// 解析当前对话使用的对话模型：
     /// 优先会话内选择的模型，其次使用设置中的对话模型选择
     pub fn resolve_chat_model(&self, conv: &Conversation) -> Option<(&ProviderConfig, &ModelConfig)> {
@@ -457,30 +402,6 @@ impl AppSettings {
             .and_then(|sel| self.find_model(sel))
             .or_else(|| self.image_models().into_iter().next())
     }
-
-    /// 解析视频生成模型（mode: VIDEO_MODE_T2V 文生 / VIDEO_MODE_I2V 图生 / VIDEO_MODE_R2V 参考生视频）
-    pub fn resolve_video_model(&self, mode: &str) -> Option<(&ProviderConfig, &ModelConfig)> {
-        match mode {
-            VIDEO_MODE_I2V => self
-                .video_model_i2v
-                .as_ref()
-                .and_then(|sel| self.find_model(sel))
-                .or_else(|| self.video_models().into_iter().find(|(_, m)| m.name.to_lowercase().contains("i2v")))
-                .or_else(|| self.video_models().into_iter().next()),
-            // 参考生视频需要专用 r2v 模型（如 wan2.7-r2v / wan2.6-r2v），不做跨模式回退
-            VIDEO_MODE_R2V => self
-                .video_model_r2v
-                .as_ref()
-                .and_then(|sel| self.find_model(sel))
-                .or_else(|| self.video_models().into_iter().find(|(_, m)| m.name.to_lowercase().contains("r2v"))),
-            _ => self
-                .video_model_t2v
-                .as_ref()
-                .and_then(|sel| self.find_model(sel))
-                .or_else(|| self.video_models().into_iter().find(|(_, m)| m.name.to_lowercase().contains("t2v")))
-                .or_else(|| self.video_models().into_iter().next()),
-        }
-    }
 }
 
 /// 遗留设置迁移：旧版 deepseek / gen 配置 -> 统一提供商体系
@@ -492,10 +413,8 @@ pub fn migrate_legacy_providers(s: &AppSettings) -> AppSettings {
     let mut providers: Vec<ProviderConfig> = Vec::new();
     let mut chat_sel: Option<ModelSelection> = None;
     let mut image_sel: Option<ModelSelection> = None;
-    let mut video_t2v: Option<ModelSelection> = None;
-    let mut video_i2v: Option<ModelSelection> = None;
 
-    // DeepSeek 官方（Anthropic 协议）
+    // DeepSeek 官方（OpenAI 兼容协议）
     if !s.deepseek.api_key.trim().is_empty() {
         let pid = "deepseek".to_string();
         let flash_id = "m_flash".to_string();
@@ -503,12 +422,12 @@ pub fn migrate_legacy_providers(s: &AppSettings) -> AppSettings {
         providers.push(ProviderConfig {
             id: pid.clone(),
             name: "DeepSeek 官方".into(),
-            protocol: PROTOCOL_ANTHROPIC.into(),
-            api_base: "https://api.deepseek.com/anthropic".into(),
+            protocol: PROTOCOL_OPENAI.into(),
+            api_base: "https://api.deepseek.com/v1".into(),
             api_key: s.deepseek.api_key.clone(),
             models: vec![
-                ModelConfig { id: flash_id.clone(), name: "deepseek-v4-flash".into(), model_type: MODEL_TYPE_TEXT.into(), video_api: VIDEO_API_AUTO.into(), context_tokens: 131_072 },
-                ModelConfig { id: pro_id.clone(), name: "deepseek-v4-pro".into(), model_type: MODEL_TYPE_TEXT.into(), video_api: VIDEO_API_AUTO.into(), context_tokens: 131_072 },
+                ModelConfig { id: flash_id.clone(), name: "deepseek-v4-flash".into(), model_type: MODEL_TYPE_TEXT.into(), context_tokens: 131_072 },
+                ModelConfig { id: pro_id.clone(), name: "deepseek-v4-pro".into(), model_type: MODEL_TYPE_TEXT.into(), context_tokens: 131_072 },
             ],
         });
         chat_sel = Some(ModelSelection { provider_id: pid, model_id: flash_id });
@@ -519,19 +438,9 @@ pub fn migrate_legacy_providers(s: &AppSettings) -> AppSettings {
         let pid = "siliconflow".to_string();
         let mut models = Vec::new();
         let img_id = "m_sf_img".to_string();
-        let t2v_id = "m_sf_t2v".to_string();
-        let i2v_id = "m_sf_i2v".to_string();
         if !sf.image_model.is_empty() {
-            models.push(ModelConfig { id: img_id.clone(), name: sf.image_model.clone(), model_type: MODEL_TYPE_IMAGE.into(), video_api: VIDEO_API_AUTO.into(), context_tokens: 131_072 });
+            models.push(ModelConfig { id: img_id.clone(), name: sf.image_model.clone(), model_type: MODEL_TYPE_IMAGE.into(), context_tokens: 131_072 });
             image_sel = Some(ModelSelection { provider_id: pid.clone(), model_id: img_id });
-        }
-        if !sf.video_model_t2v.is_empty() {
-            models.push(ModelConfig { id: t2v_id.clone(), name: sf.video_model_t2v.clone(), model_type: MODEL_TYPE_VIDEO.into(), video_api: VIDEO_API_SILICONFLOW.into(), context_tokens: 131_072 });
-            video_t2v = Some(ModelSelection { provider_id: pid.clone(), model_id: t2v_id });
-        }
-        if !sf.video_model_i2v.is_empty() {
-            models.push(ModelConfig { id: i2v_id.clone(), name: sf.video_model_i2v.clone(), model_type: MODEL_TYPE_VIDEO.into(), video_api: VIDEO_API_SILICONFLOW.into(), context_tokens: 131_072 });
-            video_i2v = Some(ModelSelection { provider_id: pid.clone(), model_id: i2v_id });
         }
         providers.push(ProviderConfig {
             id: pid,
@@ -542,25 +451,15 @@ pub fn migrate_legacy_providers(s: &AppSettings) -> AppSettings {
             models,
         });
     }
-    // 阿里云百炼（OpenAI 协议 + DashScope 视频）
+    // 阿里云百炼（OpenAI 兼容协议）
     let ali = &s.gen.alibaba;
     if !ali.api_key.trim().is_empty() {
         let pid = "alibaba".to_string();
         let mut models = Vec::new();
         let img_id = "m_ali_img".to_string();
-        let t2v_id = "m_ali_t2v".to_string();
-        let i2v_id = "m_ali_i2v".to_string();
         if !ali.image_model.is_empty() {
-            models.push(ModelConfig { id: img_id.clone(), name: ali.image_model.clone(), model_type: MODEL_TYPE_IMAGE.into(), video_api: VIDEO_API_AUTO.into(), context_tokens: 131_072 });
+            models.push(ModelConfig { id: img_id.clone(), name: ali.image_model.clone(), model_type: MODEL_TYPE_IMAGE.into(), context_tokens: 131_072 });
             image_sel = Some(ModelSelection { provider_id: pid.clone(), model_id: img_id });
-        }
-        if !ali.video_model_t2v.is_empty() {
-            models.push(ModelConfig { id: t2v_id.clone(), name: ali.video_model_t2v.clone(), model_type: MODEL_TYPE_VIDEO.into(), video_api: VIDEO_API_DASHSCOPE.into(), context_tokens: 131_072 });
-            video_t2v = Some(ModelSelection { provider_id: pid.clone(), model_id: t2v_id });
-        }
-        if !ali.video_model_i2v.is_empty() {
-            models.push(ModelConfig { id: i2v_id.clone(), name: ali.video_model_i2v.clone(), model_type: MODEL_TYPE_VIDEO.into(), video_api: VIDEO_API_DASHSCOPE.into(), context_tokens: 131_072 });
-            video_i2v = Some(ModelSelection { provider_id: pid.clone(), model_id: i2v_id });
         }
         providers.push(ProviderConfig {
             id: pid,
@@ -577,12 +476,12 @@ pub fn migrate_legacy_providers(s: &AppSettings) -> AppSettings {
         providers.push(ProviderConfig {
             id: "deepseek".into(),
             name: "DeepSeek 官方".into(),
-            protocol: PROTOCOL_ANTHROPIC.into(),
-            api_base: "https://api.deepseek.com/anthropic".into(),
+            protocol: PROTOCOL_OPENAI.into(),
+            api_base: "https://api.deepseek.com/v1".into(),
             api_key: String::new(),
             models: vec![
-                ModelConfig { id: "m_flash".into(), name: "deepseek-v4-flash".into(), model_type: MODEL_TYPE_TEXT.into(), video_api: VIDEO_API_AUTO.into(), context_tokens: 131_072 },
-                ModelConfig { id: "m_pro".into(), name: "deepseek-v4-pro".into(), model_type: MODEL_TYPE_TEXT.into(), video_api: VIDEO_API_AUTO.into(), context_tokens: 131_072 },
+                ModelConfig { id: "m_flash".into(), name: "deepseek-v4-flash".into(), model_type: MODEL_TYPE_TEXT.into(), context_tokens: 131_072 },
+                ModelConfig { id: "m_pro".into(), name: "deepseek-v4-pro".into(), model_type: MODEL_TYPE_TEXT.into(), context_tokens: 131_072 },
             ],
         });
         chat_sel = Some(ModelSelection { provider_id: "deepseek".into(), model_id: "m_flash".into() });
@@ -591,12 +490,6 @@ pub fn migrate_legacy_providers(s: &AppSettings) -> AppSettings {
     out.providers = providers;
     out.chat_model = chat_sel;
     out.image_model = image_sel;
-    if out.video_model_t2v.is_none() {
-        out.video_model_t2v = video_t2v;
-    }
-    if out.video_model_i2v.is_none() {
-        out.video_model_i2v = video_i2v;
-    }
     out
 }
 

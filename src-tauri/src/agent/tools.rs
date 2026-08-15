@@ -5,7 +5,7 @@ use tauri::AppHandle;
 
 use crate::commands::AppState;
 use crate::llm::CancelToken;
-use crate::models::Artifact;
+use crate::models::{Artifact, SearchItem};
 
 pub const TOOL_WEB_SEARCH: &str = "web_search";
 pub const TOOL_READ_FILE: &str = "read_file";
@@ -17,35 +17,30 @@ pub const TOOL_GLOB: &str = "glob";
 pub const TOOL_GREP: &str = "grep";
 pub const TOOL_BASH: &str = "bash";
 pub const TOOL_GENERATE_IMAGE: &str = "generate_image";
-pub const TOOL_GENERATE_VIDEO: &str = "generate_video";
 
 pub struct ToolOutcome {
     pub content: String,
     pub artifacts: Vec<Artifact>,
+    /// web_search 返回的原始搜索结果（持久化后供前端展示搜索来源卡片）
+    pub search_items: Vec<SearchItem>,
 }
 
-/// 按会话模式构建工具集合（anthropic 格式）
+/// 按会话模式构建工具集合（OpenAI 兼容格式）
+/// chat：联网搜索（可选）+ 图片生成；agent：文件/编程工具 + 图片生成（+ 联网搜索）
 pub fn tools_for_mode(mode: &str, web_search: bool) -> Vec<serde_json::Value> {
     let mut tools: Vec<serde_json::Value> = Vec::new();
     if web_search {
         tools.push(web_search_tool());
     }
     match mode {
-        crate::models::MODE_IMAGE => {
-            tools.push(generate_image_tool());
-        }
-        crate::models::MODE_VIDEO => {
-            tools.push(generate_video_tool());
-        }
-        crate::models::MODE_BUILD => {
-            tools.extend(file_tools());
-        }
         crate::models::MODE_AGENT => {
             tools.extend(file_tools());
             tools.push(generate_image_tool());
-            tools.push(generate_video_tool());
         }
-        _ => {}
+        // chat 模式（含图片生成）
+        _ => {
+            tools.push(generate_image_tool());
+        }
     }
     tools
 }
@@ -61,80 +56,70 @@ pub async fn execute_tool(
     token: &CancelToken,
 ) -> Result<ToolOutcome, String> {
     let outcome = match name {
-        TOOL_WEB_SEARCH => {            let outcome = crate::llm::search::execute_search(
+        TOOL_WEB_SEARCH => {
+            let outcome = crate::llm::search::execute_search(
                 app, state, conv_id, arguments, &settings.search, token,
             )
             .await?;
             Ok(ToolOutcome {
                 content: outcome.summary,
                 artifacts: Vec::new(),
+                search_items: outcome.items,
             })
         }
         TOOL_READ_FILE => Ok(ToolOutcome {
             content: read_file(app, state, conv_id, arguments).await,
             artifacts: Vec::new(),
+            search_items: Vec::new(),
         }),
         TOOL_WRITE_FILE => Ok(ToolOutcome {
             content: write_file(app, state, conv_id, arguments).await,
             artifacts: Vec::new(),
+            search_items: Vec::new(),
         }),
         TOOL_EDIT_FILE => Ok(ToolOutcome {
             content: edit_file(app, state, conv_id, arguments).await,
             artifacts: Vec::new(),
+            search_items: Vec::new(),
         }),
         TOOL_DELETE_FILE => Ok(ToolOutcome {
             content: delete_file(app, state, conv_id, arguments).await,
             artifacts: Vec::new(),
+            search_items: Vec::new(),
         }),
         TOOL_LIST_FILES => Ok(ToolOutcome {
             content: list_files(app, state, conv_id, arguments).await,
             artifacts: Vec::new(),
+            search_items: Vec::new(),
         }),
         TOOL_GLOB => Ok(ToolOutcome {
             content: glob_files(state, conv_id, arguments),
             artifacts: Vec::new(),
+            search_items: Vec::new(),
         }),
         TOOL_GREP => Ok(ToolOutcome {
             content: grep_files(state, conv_id, arguments),
             artifacts: Vec::new(),
+            search_items: Vec::new(),
         }),
         TOOL_BASH => {
             let output = run_bash(app, state, conv_id, arguments, token).await?;
             Ok(ToolOutcome {
                 content: output,
                 artifacts: Vec::new(),
+                search_items: Vec::new(),
             })
         }
         TOOL_GENERATE_IMAGE => {
-            let (content, artifacts) =
-                crate::agent::generate::generate_image(app, state, settings, conv_id, arguments).await?;
-            Ok(ToolOutcome { content, artifacts })
-        }
-        TOOL_GENERATE_VIDEO => {
-            // 图生视频：若模型未提供 image，自动使用用户最近上传的图片
-            let mut args: serde_json::Value =
-                serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
-            let has_image = args
-                .get("image")
-                .and_then(|v| v.as_str())
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-            if !has_image {
-                if let Some(data_url) = crate::commands::latest_user_image_data_url(state, conv_id)
-                {
-                    if args.is_null() {
-                        args = serde_json::json!({});
-                    }
-                    args["image"] = serde_json::json!(data_url);
-                }
-            }
-            let final_args = serde_json::to_string(&args)
-                .unwrap_or_else(|_| arguments.to_string());
-            let (content, artifacts) = crate::agent::generate::generate_video(
-                app, state, settings, conv_id, &final_args,
+            let (content, artifacts) = crate::agent::generate::generate_image(
+                app, state, settings, conv_id, arguments, token,
             )
             .await?;
-            Ok(ToolOutcome { content, artifacts })
+            Ok(ToolOutcome {
+                content,
+                artifacts,
+                search_items: Vec::new(),
+            })
         }
         _ => Err(format!("未知工具: {name}")),
     };
@@ -519,7 +504,7 @@ async fn run_bash(
     result
 }
 
-// ==================== 工具定义（anthropic 格式） ====================
+// ==================== 工具定义（OpenAI 兼容格式） ====================
 
 fn tool_def(name: &str, description: &str, properties: serde_json::Value, required: Vec<&str>) -> serde_json::Value {
     json!({
@@ -616,27 +601,6 @@ fn generate_image_tool() -> serde_json::Value {
             "prompt": {"type": "string", "description": "图片描述，越详细越好（主体、场景、风格、光线、构图等）"},
             "image_size": {"type": "string", "enum": ["1024x1024", "960x1280", "768x1024", "720x1440", "720x1280"], "description": "图片尺寸，默认 1024x1024"},
             "negative_prompt": {"type": "string", "description": "负面提示词（不希望出现的内容）"}
-        }),
-        vec!["prompt"],
-    )
-}
-
-fn generate_video_tool() -> serde_json::Value {
-    tool_def(
-        TOOL_GENERATE_VIDEO,
-        "根据文字描述生成一段短视频（AI 视频生成）。当用户要求生成视频/动画/短片时，必须调用此工具——系统会调用专门的视频模型完成生成，直接调用即可。生成耗时约几分钟，完成后自动保存到会话 videos 目录。\n\
-         三种用法（通过 mode 明确指定）：\n\
-         1. 文生视频 text2video：只用 prompt 文字描述即可；\n\
-         2. 图生视频 image2video：以用户上传的图片（系统会自动获取，无需传 image）或 image 参数（URL / data:image base64）作为起始画面；\n\
-         3. 参考图生视频 reference2video：以 images 参数中的一张或多张参考图生成视频（需参考生视频 r2v 模型）。\n\
-         用户明确要求基于某张图/把图片做成视频时，优先使用图生视频 image2video。\n\
-         若刚用 generate_image 生成了图片、要基于它生成视频：mode 用 image2video，image 传该图片路径（如 images/xxx.png）。",
-        json!({
-            "mode": {"type": "string", "enum": ["text2video", "image2video", "reference2video"], "description": "可选：文生视频 / 图生视频 / 参考图生视频；缺省时系统按是否提供图片自动判断"},
-            "prompt": {"type": "string", "description": "视频内容描述（画面、动作、镜头运动等）"},
-            "image": {"type": "string", "description": "可选：图生视频的起始图片——可传图片 URL、data:image base64，或本会话内图片路径（如 images/xxx.png，即 generate_image 的产物）；留空则自动使用用户最近上传的图片"},
-            "images": {"type": "array", "items": {"type": "string"}, "description": "可选：参考图生视频的参考图片列表（URL / base64）"},
-            "image_size": {"type": "string", "enum": ["1280x720", "720x1280", "960x960"], "description": "视频画幅，默认 1280x720"}
         }),
         vec!["prompt"],
     )

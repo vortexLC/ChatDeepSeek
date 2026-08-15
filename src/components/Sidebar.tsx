@@ -5,8 +5,6 @@ import { ChatIcon, PlusIcon, SettingsIcon, TrashIcon } from "./icons";
 interface SidebarProps {
   conversations: Conversation[];
   activeId: number | null;
-  /** 各会话进行中（pending）任务数量，>0 时显示"生成中"徽标 */
-  pendingJobs?: Record<number, number>;
   onSelect: (id: number) => void;
   onNew: () => void;
   onDelete: (id: number) => void;
@@ -34,7 +32,6 @@ function formatTime(ts: number): string {
 export function Sidebar({
   conversations,
   activeId,
-  pendingJobs = {},
   onSelect,
   onNew,
   onDelete,
@@ -128,12 +125,6 @@ export function Sidebar({
                       <span className="conv-title" title={c.title}>
                         {c.title}
                       </span>
-                      {(pendingJobs[c.id] ?? 0) > 0 && (
-                        <span className="conv-pending" title="视频正在后台生成">
-                          <span className="dot-pulse" />
-                          生成中
-                        </span>
-                      )}
                       <span className="conv-time">{formatTime(c.updated_at)}</span>
                       {c.id === confirmId ? (
                         <button

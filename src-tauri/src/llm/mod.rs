@@ -1,4 +1,3 @@
-pub mod anthropic;
 pub mod openai;
 pub mod search;
 
@@ -7,7 +6,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Notify;
 
 use tauri::{AppHandle, Emitter};
 
@@ -15,19 +13,22 @@ use crate::agent::tools;
 use crate::commands::{AppState, emit};
 use crate::models::*;
 
-pub const MAX_TOOL_ROUNDS: usize = 8;
+pub const MAX_TOOL_ROUNDS: usize = 16;
 
 #[derive(Clone)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    /// watch 通道：广播取消事件给所有等待者。
+    /// 此前用 Notify，notify_one 只能唤醒一个等待者——流式循环与工具执行
+    /// 同时等待时，停止操作可能丢失唤醒（表现为停止按钮失灵）
+    notify: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl CancelToken {
     pub fn new() -> Self {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
-            notify: Arc::new(Notify::new()),
+            notify: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
     }
 
@@ -37,12 +38,16 @@ impl CancelToken {
 
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Relaxed);
-        self.notify.notify_one();
+        let _ = self.notify.send(true);
     }
 
+    /// 阻塞直到取消。watch 通道自带"最后值"语义，无丢失唤醒问题
     pub async fn wait(&self) {
+        let mut rx = self.notify.subscribe();
         while !self.is_cancelled() {
-            self.notify.notified().await;
+            if rx.changed().await.is_err() {
+                return;
+            }
         }
     }
 }
@@ -91,6 +96,8 @@ pub struct Accum {
     pub tool_results: Vec<ToolResult>,
     pub search_items: Vec<SearchItem>,
     pub artifacts: Vec<Artifact>,
+    /// 执行时间线：思考与各次工具调用按发生顺序记录
+    pub steps: Vec<ToolStep>,
 }
 
 impl Accum {
@@ -100,6 +107,7 @@ impl Accum {
             && self.search_items.is_empty()
             && self.tool_calls.is_empty()
             && self.artifacts.is_empty()
+            && self.steps.is_empty()
     }
 }
 
@@ -162,26 +170,23 @@ fn today_cn() -> String {
     format!("{y}-{m:02}-{d:02}")
 }
 
-/// 构建系统提示词（Anthropic / OpenAI 协议共用）。
+/// 构建系统提示词（OpenAI 协议）。
 /// 按会话模式附加工具使用说明；生成类模式明确要求模型调用生成工具、禁止以
 /// "文本模型无法生成"为由拒绝，也不要让用户复制提示词去外部工具生成。
 pub(crate) fn build_system_prompt(conv: &Conversation) -> String {
     let date = today_cn();
     let mode_hint = match conv.mode.as_str() {
-        MODE_BUILD => "\n\n【当前模式：Build】你可以使用编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）在本会话隔离目录中创建和修改文件、执行命令，完成用户的开发任务。所有文件仅保存在本会话目录内，无法访问会话目录之外的文件（访问越界需用户确认）。必须通过函数调用机制调用工具，工具参数不要写在回复正文中（不要输出 JSON 参数）。",
         MODE_AGENT => "\n\n【当前模式：Agent】你拥有以下全部工具能力：\n\
 1. 编程工具（read_file / write_file / edit_file / delete_file / list_files / glob / grep / bash）：在本会话隔离目录中读写文件、执行命令，完成开发任务；\n\
-2. generate_image：生成图片。当用户要求生成、绘制、设计图片/图像/插画/海报/壁纸等任何视觉内容时，必须调用此工具——系统会调用专门的绘图模型完成生成并自动保存；\n\
-3. generate_video：生成视频。当用户要求生成视频/动画/短片时，必须调用此工具（耗时约几分钟）。\n\
+2. generate_image：生成图片。当用户要求生成、绘制、设计图片/图像/插画/海报/壁纸等任何视觉内容时，必须调用此工具——系统会调用专门的绘图模型完成生成并自动保存。\n\
+【工具调用效率】需要同时获取多项独立信息（如多次搜索、读取多个文件、列目录+搜索）时，请在同一轮中并行发起多个工具调用，系统会并发执行只读工具，显著缩短等待时间；有先后依赖的操作（先读后写、先建目录再写文件）必须分轮进行。\n\
 【重要】\n\
-- 你确实具备图片与视频生成能力（由上述工具调用专门模型实现）。严禁回复「我无法生成图片/视频」「作为文本/语言模型我不能…」「你可以把提示词复制到 Midjourney / Stable Diffusion / Runway / 可灵等工具中」之类的话术。\n\
-- 需要生成时，立即实际发起对应工具调用。工具参数不要写在回复正文中——严禁输出 JSON 提示词，或描述「调用 generate_image：prompt: …」这类文字而不真正调用；也严禁只说「正在为您生成」却不发起调用。调用工具前不要输出冗长的计划、分镜脚本或提示词设计。\n\
-- 用户要求「先生成图片、再基于该图生成视频」时：先调用 generate_image，等拿到图片结果（含 images/xxx.png 路径）后，再调用 generate_video（mode=image2video，image 传刚生成的图片路径 images/xxx.png）。",
-        MODE_IMAGE => "\n\n【当前模式：Image】你具备图片生成能力：当用户要求生成、绘制、设计任何图片/图像/插画/海报/壁纸等视觉内容时，必须调用 generate_image 工具——系统会调用专门的绘图模型完成生成并自动保存。\n\
-【重要】严禁回复「我无法生成图片」「作为文本模型我不能画图」「请去 Midjourney / Stable Diffusion 等外部工具」等话术，也不要只输出提示词。必须通过函数调用机制调用 generate_image 工具，工具参数不要写在回复正文中（不要输出 JSON 提示词）。",
-        MODE_VIDEO => "\n\n【当前模式：Video】你具备视频生成能力：当用户要求生成视频/动画/短片时，必须调用 generate_video 工具，并按需选择 mode：text2video 文生视频（无需图片）；image2video 图生视频（图片作首帧）；reference2video 参考图生视频（参考图片风格/主体，需 r2v 模型）。image/images 可传图片 URL、base64 或本会话内图片路径（如 images/xxx.png，即 generate_image 的产物）；图生/参考模式下若用户已上传图片也可不传 image，系统自动使用最近上传的图片。生成需几分钟，请告知用户耐心等待。\n\
-【重要】严禁回复「我无法生成视频」等话术，也不要只给提示词。必须通过函数调用机制调用 generate_video 工具，工具参数不要写在回复正文中（不要输出 JSON 提示词）。",
-        _ => "",
+- 你确实具备图片生成能力（由上述工具调用专门模型实现）。严禁回复「我无法生成图片」「作为文本/语言模型我不能…」「你可以把提示词复制到 Midjourney / Stable Diffusion 等工具中」之类的话术。\n\
+- 需要生成时，立即实际发起对应工具调用。工具参数不要写在回复正文中——严禁输出 JSON 提示词，或描述「调用 generate_image：prompt: …」这类文字而不真正调用；也严禁只说「正在为您生成」却不发起调用。调用工具前不要输出冗长的计划或提示词设计。\n\
+- 若当前环境确实无法发起原生函数调用，可直接在回复正文中输出 JSON 格式的工具参数（形如 {\"prompt\": \"...\"}，可用代码块包裹），系统会自动识别并执行。无论哪种方式，都不要在回复中讨论工具调用格式，也不要输出 call、函数名等调用标记，直接输出参数即可。",
+        // chat 模式（含图片生成）
+        _ => "\n\n【当前模式：Chat】你具备图片生成能力：当用户要求生成、绘制、设计任何图片/图像/插画/海报/壁纸等视觉内容时，必须调用 generate_image 工具——系统会调用专门的绘图模型完成生成并自动保存。\n\
+【重要】严禁回复「我无法生成图片」「作为文本模型我不能画图」「请去 Midjourney / Stable Diffusion 等外部工具」等话术，也不要只输出提示词。必须通过函数调用机制调用 generate_image 工具，工具参数不要写在回复正文中（不要输出 JSON 提示词）。若当前环境确实无法发起原生函数调用，可直接在回复正文中输出 JSON 格式的工具参数（形如 {\"prompt\": \"...\"}，可用代码块包裹），系统会自动识别并执行。无论哪种方式，都不要在回复中讨论工具调用格式，也不要输出 call、函数名等调用标记。",
     };
     let base = if conv.web_search {
         format!(
@@ -337,7 +342,90 @@ fn build_outgoing(
             _ => {}
         }
     }
-    out
+    // 硬截断保护：估算总量超过模型上下文容量时，从最旧的消息组开始丢弃
+    // （压缩失败 / 单条超大消息等场景的兜底，避免直接发送导致 API 400）
+    truncate_outgoing(state, conv, out)
+}
+
+/// 按消息组硬截断 outgoing 消息，确保估算 token 不超过模型上下文容量。
+/// 消息组：User 消息为一组；Assistant（含 tool_calls）+ 其紧随的 Tool
+/// 结果为一组——工具调用与结果必须同组，拆开会产生孤儿 tool_result
+/// 导致 API 400。首条摘要消息与最后一组始终保留。
+fn truncate_outgoing(
+    state: &AppState,
+    conv: &Conversation,
+    out: Vec<OutMsg>,
+) -> Vec<OutMsg> {
+    let total = state.db.get_settings().chat_context_total(conv);
+    let overhead = if conv.mode == "agent" {
+        crate::models::CONTEXT_OVERHEAD_AGENT
+    } else {
+        crate::models::CONTEXT_OVERHEAD_CHAT
+    };
+    let outmsg_tokens = |m: &OutMsg| -> u64 {
+        match m {
+            OutMsg::User { content, images, docs } => {
+                crate::db::estimate_tokens(content)
+                    + crate::db::estimate_tokens(docs)
+                    + (images.len() as u64) * crate::models::CONTEXT_IMAGE_TOKENS
+            }
+            OutMsg::Assistant { content, tool_calls } => {
+                crate::db::estimate_tokens(content)
+                    + tool_calls
+                        .iter()
+                        .map(|tc| crate::db::estimate_tokens(&tc.arguments))
+                        .sum::<u64>()
+            }
+            OutMsg::Tool { content, .. } => crate::db::estimate_tokens(content),
+        }
+    };
+    let sum: u64 = out.iter().map(&outmsg_tokens).sum();
+    if sum + overhead <= total {
+        return out;
+    }
+    // 划分消息组：(组内起始下标, 组 token)
+    let mut groups: Vec<(usize, u64)> = Vec::new();
+    for (i, m) in out.iter().enumerate() {
+        let starts = matches!(m, OutMsg::User { .. } | OutMsg::Assistant { .. });
+        if starts || groups.is_empty() {
+            groups.push((i, outmsg_tokens(m)));
+        } else {
+            groups.last_mut().unwrap().1 += outmsg_tokens(m);
+        }
+    }
+    // 摘要消息（首条 User 且存在摘要）不参与丢弃
+    let has_summary = !conv.summary.is_empty() && matches!(out.first(), Some(OutMsg::User { .. }));
+    let first_droppable = if has_summary { 1 } else { 0 };
+    if groups.len() <= first_droppable + 1 {
+        return out; // 无可丢弃组（摘要 + 最后一组）
+    }
+    let target = total.saturating_sub(overhead);
+    let mut acc = sum;
+    // 从最旧可丢组开始丢弃，直到达标；cut = 第一个保留组的起始消息下标
+    let mut cut: Option<usize> = None;
+    for gi in first_droppable..groups.len() - 1 {
+        if acc <= target {
+            cut = Some(groups[gi].0);
+            break;
+        }
+        acc = acc.saturating_sub(groups[gi].1);
+    }
+    let Some(cut) = cut else {
+        return out; // 丢光可丢组仍超限（最后一组本身超大）：原样返回交由 API 报错
+    };
+    let dropped_groups = groups[first_droppable..]
+        .iter()
+        .filter(|(s, _)| *s < cut)
+        .count();
+    log::warn!(
+        "[context] 会话 {} 估算 {} token 超容量 {total}，硬截断丢弃最旧 {} 组消息（保留摘要与近期消息）",
+        conv.id,
+        sum + overhead,
+        dropped_groups
+    );
+    let mut kept: Vec<OutMsg> = out.iter().take(first_droppable).cloned().collect();
+    kept.extend(out.into_iter().skip(cut));
+    kept
 }
 
 pub async fn run_agent(
@@ -415,6 +503,7 @@ fn persist(state: &AppState, conv: &Conversation, acc: &Accum) -> Result<(), Str
         &tool_results_json,
         &acc.search_items,
         &acc.artifacts,
+        &acc.steps,
     )?;
     state.db.touch(conv.id);
     Ok(())
@@ -461,10 +550,18 @@ async fn run_agent_inner(
 
     let mut cur = build_outgoing(state, &send_conv, !tools.is_empty());
 
-    for _round in 0..MAX_TOOL_ROUNDS {
+    for round in 0..MAX_TOOL_ROUNDS {
         if token.is_cancelled() {
             return Err("已停止生成".into());
         }
+
+        // 最后一轮不再携带工具：强制模型基于已有工具结果给出最终回答，
+        // 避免 Agent 长任务到达轮次上限时被静默截断（最后的工具结果得不到回应）
+        let round_tools: &[serde_json::Value] = if round + 1 == MAX_TOOL_ROUNDS {
+            &[]
+        } else {
+            &tools
+        };
 
         let analyzing = cur.iter().any(|m| matches!(m, OutMsg::Tool { .. }));
         emit(
@@ -474,14 +571,28 @@ async fn run_agent_inner(
             Some(if analyzing { "analyzing" } else { "thinking" }),
         );
 
-        let mut turn = match provider.protocol.as_str() {
-            PROTOCOL_OPENAI => {
-                openai::run(app, state, provider, model, conv, &cur, &tools, token).await?
-            }
-            _ => {
-                anthropic::run(app, state, provider, model, conv, &cur, &tools, token).await?
-            }
-        };
+        let round_started = std::time::Instant::now();
+        let mut turn =
+            openai::run(app, state, provider, model, conv, &cur, round_tools, token).await?;
+
+        // 思考步骤进入时间线（发生在工具调用之前）：
+        // 耗时以本轮模型调用总时长计，纯对话场景同样形成"深度思考"步骤
+        if !turn.reasoning.is_empty() {
+            let step = ToolStep {
+                kind: "reasoning".into(),
+                label: "深度思考".into(),
+                tool: String::new(),
+                duration_ms: round_started.elapsed().as_millis() as u64,
+                items: Vec::new(),
+            };
+            emit(
+                app,
+                conv.id,
+                "tool_step",
+                serde_json::to_string(&step).ok().as_deref(),
+            );
+            acc.steps.push(step);
+        }
 
         // 流式中途被用户停止：已生成的部分内容先收进 acc，
         // 再以"已停止"结束，由外层 persist 保存（否则已输出的内容会全部丢失）
@@ -552,8 +663,14 @@ async fn run_agent_inner(
             }
             // 承诺话术纠正：模型只说「正在为您生成…请稍等」而未实际调用工具时，
             // 不结束回合，回喂提示要求提供工具参数（模型随后输出 JSON 由上面兜底执行），
-            // 避免"说而不做"直接结束
-            if let Some(hint) = promise_reminder_hint(&turn.content, &conv.mode) {
+            // 避免"说而不做"直接结束。若本轮已成功调用过生成工具（图片已生成），
+            // 模型说"正在生成中"是真实陈述，不再回喂提示——
+            // 否则会形成"回喂提示 → 模型纠结工具格式 → 再输出 JSON → 重复提交"的循环
+            let tool_already_called = acc
+                .tool_calls
+                .iter()
+                .any(|tc| tc.name == tools::TOOL_GENERATE_IMAGE);
+            if let Some(hint) = promise_reminder_hint(&turn.content, &conv.mode, tool_already_called) {
                 cur.push(OutMsg::User {
                     content: hint,
                     images: Vec::new(),
@@ -564,19 +681,12 @@ async fn run_agent_inner(
             break;
         }
 
-        // 防御：未提供联网搜索工具时，忽略模型误发的 web_search 调用
-        if !conv.web_search {
-            turn.tool_calls.retain(|tc| tc.name != tools::TOOL_WEB_SEARCH);
-        }
-        if turn.tool_calls.is_empty() {
-            break;
-        }
-
         let results = execute_tool_calls(app, state_arc, conv.id, &turn.tool_calls, settings, token, acc).await?;
 
-        // 按 API 要求顺序拼接上下文：assistant(tool_use) 在前，user(tool_result) 紧跟其后
+        // 按 API 要求顺序拼接上下文：assistant(tool_calls) 在前，tool 结果紧跟其后。
+        // 有原生工具调用时不做文本兜底（textual 必为 None），display_content 即 turn.content
         cur.push(OutMsg::Assistant {
-            content: turn.content,
+            content: display_content,
             tool_calls: turn.tool_calls,
         });
         for tr in results {
@@ -590,9 +700,50 @@ async fn run_agent_inner(
     Ok(())
 }
 
-/// 执行一组工具调用：逐个执行、推送产物、累计到 acc，返回按顺序的 ToolResult。
-/// 权限确认类错误（用户拒绝/超时）不终止任务：转为工具结果回喂模型，
-/// 让其调整策略（如改用会话内路径）继续，而非整个生成直接失败
+/// 可并行执行的工具集合：只读/纯网络、不写文件、不触发权限确认弹窗。
+/// 含写操作或可能请求权限确认（pending_perms 以 conv_id 为 key，并发确认会互相
+/// 覆盖）的工具必须串行执行
+const PARALLEL_SAFE_TOOLS: [&str; 5] = [
+    tools::TOOL_WEB_SEARCH,
+    tools::TOOL_LIST_FILES,
+    tools::TOOL_GLOB,
+    tools::TOOL_GREP,
+    tools::TOOL_GENERATE_IMAGE,
+];
+
+/// 执行单个工具调用：取消为致命错误上抛，其余（含权限拒绝、工具自身
+/// 失败如 API 限流/网络超时）转为结果回喂模型，由模型决定重试或调整
+/// 策略，避免单个工具失败中止整个任务
+async fn execute_one_tool(
+    app: &AppHandle,
+    state_arc: &Arc<AppState>,
+    conv_id: i64,
+    tc: &ToolCall,
+    settings: &AppSettings,
+    token: &CancelToken,
+) -> Result<tools::ToolOutcome, String> {
+    match tools::execute_tool(app, state_arc, conv_id, &tc.name, &tc.arguments, settings, token)
+        .await
+    {
+        Ok(o) => Ok(o),
+        Err(e) if e == "已停止生成" => Err(e),
+        Err(e) => {
+            log::error!("[tool] 会话 {} 调用 {} 失败: {}", conv_id, tc.name, e);
+            Ok(tools::ToolOutcome {
+                content: format!("工具执行失败: {e}"),
+                artifacts: Vec::new(),
+                search_items: Vec::new(),
+            })
+        }
+    }
+}
+
+/// 执行一组工具调用：推送产物、累计到 acc，返回按调用顺序的 ToolResult。
+///
+/// 并行优化：当本批调用全部属于可并行集合（只读/纯网络工具）且数量 ≥ 2 时，
+/// 用 join_all 并发执行——模型一轮发起多个 tool_calls（并行调用）时，
+/// 总耗时从「各工具之和」降为「最慢一个」。写文件 / bash / 可能触发
+/// 权限确认的批次保持串行，避免文件竞争与权限弹窗互相覆盖。
 async fn execute_tool_calls(
     app: &AppHandle,
     state_arc: &Arc<AppState>,
@@ -602,36 +753,49 @@ async fn execute_tool_calls(
     token: &CancelToken,
     acc: &mut Accum,
 ) -> Result<Vec<ToolResult>, String> {
-    let mut results: Vec<ToolResult> = Vec::new();
-    for tc in tool_calls {
-        if token.is_cancelled() {
-            return Err("已停止生成".into());
-        }
+    let parallel = tool_calls.len() >= 2
+        && tool_calls
+            .iter()
+            .all(|tc| PARALLEL_SAFE_TOOLS.contains(&tc.name.as_str()));
+
+    let outcomes: Vec<(std::time::Duration, tools::ToolOutcome)> = if parallel {
+        log::info!(
+            "[tool] 会话 {} 并行执行 {} 个工具调用: {}",
+            conv_id,
+            tool_calls.len(),
+            tool_calls.iter().map(|tc| tc.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
         let started = std::time::Instant::now();
-        let outcome = match tools::execute_tool(
-            app, state_arc, conv_id, &tc.name, &tc.arguments, settings, token,
-        )
-        .await
-        {
-            Ok(o) => o,
-            Err(e) if is_permission_error(&e) => {
-                // 权限拒绝不是致命错误：作为工具结果返回给模型继续
-                log::info!("[tool] 会话 {} 调用 {} 被用户拒绝", conv_id, tc.name);
-                tools::ToolOutcome {
-                    content: e,
-                    artifacts: Vec::new(),
-                }
+        let futs = tool_calls
+            .iter()
+            .map(|tc| execute_one_tool(app, state_arc, conv_id, tc, settings, token));
+        let all = futures_util::future::join_all(futs).await;
+        let elapsed = started.elapsed();
+        // 按原顺序检查结果：任一致命错误即上抛（与串行语义一致）
+        let mut oks = Vec::with_capacity(all.len());
+        for r in all {
+            oks.push(r?);
+        }
+        oks.into_iter().map(|o| (elapsed, o)).collect()
+    } else {
+        let mut outs = Vec::with_capacity(tool_calls.len());
+        for tc in tool_calls {
+            if token.is_cancelled() {
+                return Err("已停止生成".into());
             }
-            Err(e) => {
-                log::error!("[tool] 会话 {} 调用 {} 失败: {}", conv_id, tc.name, e);
-                return Err(e);
-            }
-        };
+            let started = std::time::Instant::now();
+            outs.push((started.elapsed(), execute_one_tool(app, state_arc, conv_id, tc, settings, token).await?));
+        }
+        outs
+    };
+
+    let mut results: Vec<ToolResult> = Vec::with_capacity(tool_calls.len());
+    for (tc, (elapsed, outcome)) in tool_calls.iter().zip(outcomes) {
         log::info!(
             "[tool] 会话 {} 调用 {} 完成，耗时 {:?}，产物 {} 个",
             conv_id,
             tc.name,
-            started.elapsed(),
+            elapsed,
             outcome.artifacts.len()
         );
         // 产物实时推送到前端
@@ -639,6 +803,17 @@ async fn execute_tool_calls(
             emit_artifact(app, conv_id, art);
         }
         acc.artifacts.extend(outcome.artifacts.clone());
+        // 搜索结果并入累计：持久化到消息的 search_results，任务结束后仍可展示来源卡片
+        acc.search_items.extend(outcome.search_items.clone());
+        // 工具步骤进入执行时间线：按发生顺序持久化并实时推送到前端
+        let step = tool_step(tc, elapsed.as_millis() as u64, &outcome.search_items);
+        emit(
+            app,
+            conv_id,
+            "tool_step",
+            serde_json::to_string(&step).ok().as_deref(),
+        );
+        acc.steps.push(step);
         let tr = ToolResult {
             tool_call_id: tc.id.clone(),
             content: outcome.content,
@@ -651,11 +826,59 @@ async fn execute_tool_calls(
     Ok(results)
 }
 
-/// 权限确认类错误（用户拒绝/确认超时/确认失效）：非致命，转为工具结果回喂模型
-fn is_permission_error(e: &str) -> bool {
-    e.starts_with("用户拒绝了该操作")
-        || e.starts_with("等待用户确认超时")
-        || e.starts_with("权限确认已失效")
+/// 由工具调用构造时间线步骤：解析参数生成人类可读摘要
+fn tool_step(tc: &ToolCall, duration_ms: u64, search_items: &[SearchItem]) -> ToolStep {
+    let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or_default();
+    let s = |k: &str| args[k].as_str().unwrap_or("").trim().to_string();
+    let trunc = |mut t: String, n: usize| {
+        if t.chars().count() > n {
+            t = t.chars().take(n).collect::<String>() + "…";
+        }
+        t
+    };
+    let base = std::path::Path::new(&s("path"))
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    let (kind, label) = match tc.name.as_str() {
+        tools::TOOL_WEB_SEARCH => {
+            let q = trunc(s("query"), 40);
+            (
+                "search",
+                format!(
+                    "联网搜索 “{q}”{}",
+                    if search_items.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {} 条结果", search_items.len())
+                    }
+                ),
+            )
+        }
+        tools::TOOL_GENERATE_IMAGE => ("image", format!("生成图片 “{}”", trunc(s("prompt"), 40))),
+        tools::TOOL_READ_FILE => ("tool", format!("读取文件 {base}")),
+        tools::TOOL_WRITE_FILE => ("tool", format!("写入文件 {base}")),
+        tools::TOOL_EDIT_FILE => ("tool", format!("编辑文件 {base}")),
+        tools::TOOL_DELETE_FILE => ("tool", format!("删除文件 {base}")),
+        tools::TOOL_LIST_FILES => ("tool", format!("列出目录 {}", trunc(s("path"), 40))),
+        tools::TOOL_GLOB => ("tool", format!("匹配文件 {}", trunc(s("pattern"), 40))),
+        tools::TOOL_GREP => ("tool", format!("搜索内容 “{}”", trunc(s("pattern"), 40))),
+        tools::TOOL_BASH => ("tool", format!("执行命令 {}", trunc(s("cmd"), 60))),
+        _ => ("tool", tc.name.clone()),
+    };
+    ToolStep {
+        kind: kind.into(),
+        label,
+        tool: tc.name.clone(),
+        duration_ms,
+        items: if tc.name == tools::TOOL_WEB_SEARCH {
+            search_items.to_vec()
+        } else {
+            Vec::new()
+        },
+    }
 }
 
 /// 从模型文本回复中识别"文本形式的工具调用"（兼容不支持 function calling、
@@ -716,10 +939,15 @@ fn parse_textual_tool_call(content: &str, mode: &str) -> Option<(String, serde_j
 
 /// 检测模型是否只输出了"承诺话术"（如「正在为您生成…请稍等」）而未实际调用工具。
 /// 命中时返回回喂提示，要求模型提供工具参数（随后模型输出 JSON 由文本兜底执行）。
-/// 约束：仅生成模式、内容含承诺词、且内容较短（长回答不打断）。
-fn promise_reminder_hint(content: &str, mode: &str) -> Option<String> {
+/// 约束：仅生成模式、内容含承诺词、内容较短（长回答不打断）、
+/// 且本轮尚未成功调用过生成工具（tool_already_called 为 false）——工具已调用时
+/// "正在生成中"是真实陈述，不打断。
+fn promise_reminder_hint(content: &str, mode: &str, tool_already_called: bool) -> Option<String> {
     let c = content.trim();
     if c.chars().count() > 200 {
+        return None;
+    }
+    if tool_already_called {
         return None;
     }
     const PROMISE_WORDS: [&str; 6] = ["正在生成", "请稍等", "请稍候", "马上", "为您生成", "开始生成"];
@@ -727,18 +955,13 @@ fn promise_reminder_hint(content: &str, mode: &str) -> Option<String> {
         return None;
     }
     let tool_hint = match mode {
-        MODE_IMAGE => format!(
+        MODE_CHAT => format!(
             "请立即调用 {} 工具并提供参数（图片描述 prompt）",
             tools::TOOL_GENERATE_IMAGE
         ),
-        MODE_VIDEO => format!(
-            "请立即调用 {} 工具并提供参数（mode 与 prompt）",
-            tools::TOOL_GENERATE_VIDEO
-        ),
         MODE_AGENT => format!(
-            "请立即调用相应工具并提供参数（如 {} 的 prompt、{} 的 mode/prompt、或文件操作参数）",
-            tools::TOOL_GENERATE_IMAGE,
-            tools::TOOL_GENERATE_VIDEO
+            "请立即调用相应工具并提供参数（如 {} 的 prompt、或文件操作参数）",
+            tools::TOOL_GENERATE_IMAGE
         ),
         _ => return None,
     };
@@ -748,7 +971,7 @@ fn promise_reminder_hint(content: &str, mode: &str) -> Option<String> {
 }
 
 /// 已知工具名集合（文本兜底识别的合法范围）
-const KNOWN_TOOL_NAMES: [&str; 11] = [
+const KNOWN_TOOL_NAMES: [&str; 10] = [
     tools::TOOL_WEB_SEARCH,
     tools::TOOL_READ_FILE,
     tools::TOOL_WRITE_FILE,
@@ -759,7 +982,6 @@ const KNOWN_TOOL_NAMES: [&str; 11] = [
     tools::TOOL_GREP,
     tools::TOOL_BASH,
     tools::TOOL_GENERATE_IMAGE,
-    tools::TOOL_GENERATE_VIDEO,
 ];
 
 /// 按工具特征字段分类 JSON 对象 → (工具名, 参数 JSON)。
@@ -794,20 +1016,14 @@ fn classify_textual_tool_call(
     // ---- 生成工具（平铺字段）----
     if let Some(prompt) = obj.get("prompt").and_then(|p| p.as_str()) {
         if !prompt.trim().is_empty() {
-            let video_hint = obj.contains_key("mode")
-                || obj.contains_key("image")
-                || obj.contains_key("images")
-                || mode == MODE_VIDEO;
-            if video_hint {
-                return Some((tools::TOOL_GENERATE_VIDEO.to_string(), v.clone()));
-            }
-            if mode == MODE_IMAGE || mode == MODE_AGENT {
+            // chat 与 agent 模式均具备图片生成能力
+            if mode == MODE_CHAT || mode == MODE_AGENT {
                 return Some((tools::TOOL_GENERATE_IMAGE.to_string(), v.clone()));
             }
         }
     }
-    // ---- 文件工具（Build / Agent）----
-    if mode == MODE_BUILD || mode == MODE_AGENT {
+    // ---- 文件工具（Agent）----
+    if mode == MODE_AGENT {
         if obj.contains_key("command") {
             return Some((tools::TOOL_BASH.to_string(), v.clone()));
         }
@@ -842,10 +1058,30 @@ fn emit_artifact(app: &AppHandle, conv_id: i64, artifact: &Artifact) {
     let _ = app.emit("chat_event", payload);
 }
 
+/// 单条消息的 token 估算（与 db::context_usage 口径一致）：
+/// 正文 + 思考 + 工具调用/结果 + 附件（图片固定值，文档按字节）
+fn message_row_tokens(r: &DbMessageRow) -> u64 {
+    let mut t = crate::db::estimate_tokens(&r.content)
+        + crate::db::estimate_tokens(&r.reasoning)
+        + crate::db::estimate_tokens(&r.tool_calls)
+        + crate::db::estimate_tokens(&r.tool_results);
+    if let Ok(atts) = serde_json::from_str::<Vec<crate::models::Attachment>>(&r.attachments) {
+        for a in atts {
+            if a.kind == "image" {
+                t += crate::models::CONTEXT_IMAGE_TOKENS;
+            } else {
+                t += ((a.size.max(0) as u64) / 4).min(20_000);
+            }
+        }
+    }
+    t
+}
+
 /// 上下文自动压缩：
 /// 当估算用量达到阈值（默认 60%）且存在尚未摘要的早期消息时，
 /// 调用对话模型将「已有摘要 + 早期消息」浓缩为一段新摘要并持久化，
-/// 之后该部分消息不再直接发送，只发送摘要与最近的若干条消息。
+/// 之后该部分消息不再直接发送，只发送摘要与保留窗口内的近期消息
+/// （窗口按 token 预算从最新往回划定）。
 /// 返回压缩后的 (summary, summarized_until)；未发生压缩返回 None。
 async fn try_compress_history(
     state: &AppState,
@@ -854,7 +1090,7 @@ async fn try_compress_history(
     model: &ModelConfig,
     token: &CancelToken,
 ) -> Option<(String, i64)> {
-    use crate::models::{CONTEXT_COMPRESS_THRESHOLD, CONTEXT_KEEP_LAST_MSGS};
+    use crate::models::{CONTEXT_COMPRESS_THRESHOLD, CONTEXT_KEEP_BUDGET_RATIO, CONTEXT_KEEP_LAST_MSGS};
     // 用户已点击停止：跳过压缩，避免无谓的摘要请求
     if token.is_cancelled() {
         return None;
@@ -868,16 +1104,39 @@ async fn try_compress_history(
         Ok(r) => r,
         Err(_) => return None,
     };
-    // 仅考虑尚未摘要的消息；新增数量不足（如刚压缩过）则跳过，避免每轮都调用摘要
+    // 仅考虑尚未摘要的消息
     let unsummarized: Vec<DbMessageRow> = rows
         .into_iter()
         .filter(|r| r.id > conv.summarized_until)
         .collect();
-    if unsummarized.len() <= CONTEXT_KEEP_LAST_MSGS + 1 {
+    if unsummarized.len() <= CONTEXT_KEEP_LAST_MSGS {
         return None;
     }
-    // 仅摘要保留窗口之前的消息
-    let cutoff_id = unsummarized[unsummarized.len() - CONTEXT_KEEP_LAST_MSGS].id;
+    // 保留窗口按 token 预算而非固定条数：从最新消息往回累计，达到预算
+    // （总量 × CONTEXT_KEEP_BUDGET_RATIO）后停止，更早的消息进入摘要。
+    // Agent 单条消息可含大量工具结果（上万 token），固定条数保留会导致
+    // "已压缩但仍超限"；至少保留最近 CONTEXT_KEEP_LAST_MSGS 条保证
+    // 最近的上下文连贯
+    let total = state
+        .db
+        .get_settings()
+        .chat_context_total(conv);
+    let budget = (total as f64 * CONTEXT_KEEP_BUDGET_RATIO) as u64;
+    let mut used_budget: u64 = 0;
+    let mut keep_from = unsummarized.len(); // 保留窗口起点（含）
+    for (i, r) in unsummarized.iter().enumerate().rev() {
+        used_budget += message_row_tokens(r);
+        keep_from = i;
+        if used_budget >= budget {
+            break;
+        }
+    }
+    // 至少保留最近 CONTEXT_KEEP_LAST_MSGS 条
+    keep_from = keep_from.min(unsummarized.len() - CONTEXT_KEEP_LAST_MSGS);
+    if keep_from == 0 {
+        return None; // 全部消息都在保留窗口内，无需压缩
+    }
+    let cutoff_id = unsummarized[keep_from].id;
     let new_rows: Vec<DbMessageRow> = unsummarized
         .into_iter()
         .filter(|r| r.id < cutoff_id)
@@ -931,7 +1190,7 @@ async fn try_compress_history(
             }
             "assistant" => {
                 // 摘要输入不携带工具调用：历史 tool_use 块没有配对的
-                // tool_result 会导致 Anthropic/OpenAI 摘要接口返回 400
+                // tool_result 会导致 OpenAI 摘要接口返回 400
                 if row.content.trim().is_empty() {
                     // 空内容消息（如停止生成时的部分思考记录）同样跳过，
                     // 避免摘要接口因缺少 content 字段报 400
@@ -949,10 +1208,7 @@ async fn try_compress_history(
     if token.is_cancelled() {
         return None;
     }
-    let summary = match provider.protocol.as_str() {
-        PROTOCOL_OPENAI => openai::summarize(state, provider, model, &msgs).await,
-        _ => anthropic::summarize(state, provider, model, &msgs).await,
-    };
+    let summary = openai::summarize(state, provider, model, &msgs).await;
     let Ok(summary) = summary else {
         // 摘要失败不应静默：记录日志便于定位（压缩是长会话免于"上下文已满"的关键）
         log::error!("[compress] 会话 {} 摘要生成失败", conv.id);
@@ -974,23 +1230,23 @@ async fn try_compress_history(
 mod tests {
     use super::*;
 
-    /// 文本形式工具调用解析：JSON/代码块/视频字段/模式约束
+    /// 文本形式工具调用解析：JSON/代码块/模式约束
     #[test]
     fn textual_tool_call_parsing() {
-        // 纯 JSON → generate_image（Image 模式）
-        let r = parse_textual_tool_call(r#"{"prompt": "一只猫"}"#, MODE_IMAGE);
+        // 纯 JSON → generate_image（Chat 模式，含图片生成）
+        let r = parse_textual_tool_call(r#"{"prompt": "一只猫"}"#, MODE_CHAT);
         assert!(r.is_some());
         let (name, args) = r.unwrap();
         assert_eq!(name, tools::TOOL_GENERATE_IMAGE);
         assert_eq!(args["prompt"], "一只猫");
 
         // 代码块包裹同样识别
-        let r = parse_textual_tool_call("```json\n{\"prompt\": \"狗\"}\n```", MODE_IMAGE);
+        let r = parse_textual_tool_call("```json\n{\"prompt\": \"狗\"}\n```", MODE_CHAT);
         assert!(r.is_some());
 
         // 文字 + 代码块 JSON（模型把工具参数写进正文的典型场景）
         let reply = "### 总\n已为您构思并生成一张图片…\n系统正在根据以下参数为您绘制图像：\n```json\n{\"prompt\": \"一只猫\"}\n```";
-        let r = parse_textual_tool_call(reply, MODE_IMAGE);
+        let r = parse_textual_tool_call(reply, MODE_CHAT);
         assert!(r.is_some());
         let (name, args) = r.unwrap();
         assert_eq!(name, tools::TOOL_GENERATE_IMAGE);
@@ -998,25 +1254,25 @@ mod tests {
 
         // 文字中直接内嵌 JSON（无代码块）同样识别
         let reply = "好的，正在为您生成：{\"prompt\": \"一只狗\", \"image_size\": \"1024x1024\"}";
-        let r = parse_textual_tool_call(reply, MODE_IMAGE);
+        let r = parse_textual_tool_call(reply, MODE_CHAT);
         assert!(r.is_some());
         assert_eq!(r.unwrap().1["image_size"], "1024x1024");
 
         // 正文包含多个 JSON 片段时优先取代码块
         let reply = "参考 {\"a\": 1}，生成：```json\n{\"prompt\": \"猫\"}\n```";
-        let r = parse_textual_tool_call(reply, MODE_IMAGE);
+        let r = parse_textual_tool_call(reply, MODE_CHAT);
         assert!(r.is_some());
         assert_eq!(r.unwrap().1["prompt"], "猫");
 
         // 位置信息：剥离展示内容中的 JSON 参数用
         let reply = "为您生成了一张图片。{\"prompt\": \"猫\"}";
-        let r = find_textual_tool_call(reply, MODE_IMAGE);
+        let r = find_textual_tool_call(reply, MODE_CHAT);
         assert!(r.is_some());
         let (_, _, start, end) = r.unwrap();
         assert_eq!(&reply[start..end], "{\"prompt\": \"猫\"}");
         // 代码块整体剥离（含 ``` 标记）
         let reply = "为您生成：\n```json\n{\"prompt\": \"狗\"}\n```";
-        let r = find_textual_tool_call(reply, MODE_IMAGE);
+        let r = find_textual_tool_call(reply, MODE_CHAT);
         assert!(r.is_some());
         let (_, _, start, end) = r.unwrap();
         assert_eq!(&reply[start..end], "```json\n{\"prompt\": \"狗\"}\n```");
@@ -1024,7 +1280,7 @@ mod tests {
         // 包装格式（模型模拟 tool_call 结构：name + arguments）
         let r = parse_textual_tool_call(
             r#"{"name": "generate_image", "arguments": {"prompt": "一只猫"}}"#,
-            MODE_IMAGE,
+            MODE_CHAT,
         );
         assert!(r.is_some());
         let (name, args) = r.unwrap();
@@ -1034,7 +1290,7 @@ mod tests {
         // arguments 为 JSON 字符串
         let r = parse_textual_tool_call(
             r#"{"name": "generate_image", "arguments": "{\"prompt\": \"狗\"}"}"#,
-            MODE_IMAGE,
+            MODE_CHAT,
         );
         assert!(r.is_some());
         assert_eq!(r.unwrap().1["prompt"], "狗");
@@ -1043,59 +1299,48 @@ mod tests {
         assert!(
             parse_textual_tool_call(
                 r#"{"name": "hack", "arguments": {"prompt": "x"}}"#,
-                MODE_IMAGE
+                MODE_CHAT
             )
             .is_none()
         );
 
-        // 含 mode 字段 → generate_video
-        let r = parse_textual_tool_call(r#"{"mode": "text2video", "prompt": "视频"}"#, MODE_IMAGE);
-        assert_eq!(r.unwrap().0, tools::TOOL_GENERATE_VIDEO);
+        // 普通文本 / 无 prompt → 不识别
+        assert!(parse_textual_tool_call("你好，有什么可以帮你", MODE_CHAT).is_none());
+        assert!(parse_textual_tool_call(r#"{"a": 1}"#, MODE_CHAT).is_none());
 
-        // Video 模式缺省 → generate_video
-        let r = parse_textual_tool_call(r#"{"prompt": "视频"}"#, MODE_VIDEO);
-        assert_eq!(r.unwrap().0, tools::TOOL_GENERATE_VIDEO);
+        // Agent 模式同样识别 generate_image
+        let r = parse_textual_tool_call(r#"{"prompt": "一只猫"}"#, MODE_AGENT);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().0, tools::TOOL_GENERATE_IMAGE);
 
-        // 普通文本 / 无 prompt / Chat 模式 → 不识别
-        assert!(parse_textual_tool_call("你好，有什么可以帮你", MODE_IMAGE).is_none());
-        assert!(parse_textual_tool_call(r#"{"a": 1}"#, MODE_IMAGE).is_none());
-        assert!(parse_textual_tool_call(r#"{"prompt": "x"}"#, MODE_CHAT).is_none());
-
-        // 文件工具（Build / Agent 模式）
-        let r = parse_textual_tool_call(r#"{"path": "a.txt"}"#, MODE_BUILD);
+        // 文件工具（Agent 模式）
+        let r = parse_textual_tool_call(r#"{"path": "a.txt"}"#, MODE_AGENT);
         assert_eq!(r.unwrap().0, tools::TOOL_READ_FILE);
-        let r = parse_textual_tool_call(r#"{"path": "a.txt", "content": "hi"}"#, MODE_BUILD);
+        let r = parse_textual_tool_call(r#"{"path": "a.txt", "content": "hi"}"#, MODE_AGENT);
         assert_eq!(r.unwrap().0, tools::TOOL_WRITE_FILE);
         let r = parse_textual_tool_call(r#"{"path": "a.txt", "old_string": "x", "new_string": "y"}"#, MODE_AGENT);
         assert_eq!(r.unwrap().0, tools::TOOL_EDIT_FILE);
-        let r = parse_textual_tool_call(r#"{"command": "dir"}"#, MODE_BUILD);
+        let r = parse_textual_tool_call(r#"{"command": "dir"}"#, MODE_AGENT);
         assert_eq!(r.unwrap().0, tools::TOOL_BASH);
-        let r = parse_textual_tool_call(r#"{"pattern": "hello"}"#, MODE_BUILD);
+        let r = parse_textual_tool_call(r#"{"pattern": "hello"}"#, MODE_AGENT);
         assert_eq!(r.unwrap().0, tools::TOOL_GREP);
         let r = parse_textual_tool_call(r#"{"dir": "src"}"#, MODE_AGENT);
         assert_eq!(r.unwrap().0, tools::TOOL_LIST_FILES);
 
-        // 文件工具 JSON 在 Image / Chat 模式不识别
-        assert!(parse_textual_tool_call(r#"{"path": "a.txt"}"#, MODE_IMAGE).is_none());
+        // 文件工具 JSON 在 Chat 模式不识别
+        assert!(parse_textual_tool_call(r#"{"path": "a.txt"}"#, MODE_CHAT).is_none());
         assert!(parse_textual_tool_call(r#"{"command": "dir"}"#, MODE_CHAT).is_none());
 
-        // 权限拒绝错误识别
-        assert!(is_permission_error("用户拒绝了该操作：bash cd /d C:\\"));
-        assert!(is_permission_error("等待用户确认超时，已拒绝该操作"));
-        assert!(is_permission_error("权限确认已失效"));
-        assert!(!is_permission_error("图片生成 API 错误 (400)"));
-        assert!(!is_permission_error("已停止生成"));
-
         // 承诺话术纠正
-        let h = promise_reminder_hint("正在为您生成中式古风庭院图片，请稍等。", MODE_IMAGE);
+        let h = promise_reminder_hint("正在为您生成中式古风庭院图片，请稍等。", MODE_CHAT, false);
         assert!(h.is_some());
         assert!(h.unwrap().contains("generate_image"));
-        let h = promise_reminder_hint("马上为您生成视频，请稍候。", MODE_VIDEO);
-        assert!(h.is_some());
-        assert!(h.unwrap().contains("generate_video"));
-        // 无承诺词 / 长回答 / 非生成模式 → 不打断
-        assert!(promise_reminder_hint("好的，我来分析一下这个问题。", MODE_IMAGE).is_none());
-        assert!(promise_reminder_hint("正在生成".repeat(120).as_str(), MODE_IMAGE).is_none());
-        assert!(promise_reminder_hint("正在生成", MODE_CHAT).is_none());
+        // 无承诺词 / 长回答 → 不打断
+        assert!(promise_reminder_hint("好的，我来分析一下这个问题。", MODE_CHAT, false).is_none());
+        assert!(promise_reminder_hint("正在生成".repeat(120).as_str(), MODE_CHAT, false).is_none());
+        // 已成功调用过生成工具（图片已生成）→ 不再回喂"未调用工具"提示，
+        // 否则会形成"回喂 → 模型纠结格式 → 再输出 JSON → 重复提交任务"的循环
+        assert!(promise_reminder_hint("图片正在生成，请稍等。", MODE_CHAT, true).is_none());
+        assert!(promise_reminder_hint("正在为您生成图片，请稍等。", MODE_AGENT, true).is_none());
     }
 }

@@ -30,11 +30,8 @@ const ACCEPT_TYPES =
   "image/png,image/jpeg,image/gif,image/webp,image/bmp,.txt,.md,.markdown,.csv,.json,.xml,.yaml,.yml,.log,.ini,.conf,.toml,.sql,.py,.js,.ts,.rs,.java,.c,.cpp,.h,.hpp,.go,.rb,.php,.sh,.bat,.ps1,.html,.css,.scss,.vue,.tsx,.jsx,.pdf";
 
 const MODE_OPTIONS: { value: AgentMode; label: string; title: string }[] = [
-  { value: "chat", label: "Chat", title: "普通对话" },
-  { value: "image", label: "Image", title: "Chat + 图片生成" },
-  { value: "video", label: "Video", title: "Chat + 视频生成" },
-  { value: "build", label: "Build", title: "编程工具（隔离沙箱）" },
-  { value: "agent", label: "Agent", title: "全部工具（编程 + 图片 + 视频）" },
+  { value: "chat", label: "Chat", title: "普通对话 + 图片生成" },
+  { value: "agent", label: "Agent", title: "编程工具 + 联网搜索 + 图片生成" },
 ];
 
 function modeLabel(mode: AgentMode): string {

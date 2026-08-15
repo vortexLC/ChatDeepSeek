@@ -165,11 +165,20 @@ export function ImageIcon({ size = 15, className }: IconProps) {
   );
 }
 
-export function VideoIcon({ size = 15, className }: IconProps) {
+export function FileIcon({ size = 14, className }: IconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-      <rect x="2" y="4" width="16" height="16" rx="2" />
-      <path d="m22 8-6 4 6 4V8z" />
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+    </svg>
+  );
+}
+
+export function TerminalIcon({ size = 14, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="m4 17 6-6-6-6" />
+      <path d="M12 19h8" />
     </svg>
   );
 }

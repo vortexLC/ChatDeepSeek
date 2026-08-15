@@ -13,7 +13,6 @@ import {
   getInitialState,
   getMessages,
   listConversations,
-  listJobs,
   onChatEvent,
   respondPermission,
   saveSettings,
@@ -33,11 +32,11 @@ import type {
   Conversation,
   EditTarget,
   Effort,
-  Job,
   Message,
   ModelOption,
   PermissionRequest,
   PreviewContent,
+  ToolStep,
   UploadAttachment,
   WebPage,
 } from "./types";
@@ -72,35 +71,28 @@ const DEFAULT_SETTINGS: AppSettings = {
       api_key: "",
       base_url: "https://api.siliconflow.cn/v1",
       image_model: "Kwai-Kolors/Kolors",
-      video_model_i2v: "Wan-AI/Wan2.2-I2V-A14B",
-      video_model_t2v: "Wan-AI/Wan2.2-T2V-A14B",
     },
     alibaba: {
       api_key: "",
       base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
       image_model: "wanx-v1",
-      video_model_i2v: "",
-      video_model_t2v: "",
     },
   },
   providers: [
     {
       id: "deepseek",
       name: "DeepSeek 官方",
-      protocol: "anthropic",
-      api_base: "https://api.deepseek.com/anthropic",
+      protocol: "openai",
+      api_base: "https://api.deepseek.com/v1",
       api_key: "",
       models: [
-        { id: "m_flash", name: "deepseek-v4-flash", model_type: "text", video_api: "auto", context_tokens: 131072 },
-        { id: "m_pro", name: "deepseek-v4-pro", model_type: "text", video_api: "auto", context_tokens: 131072 },
+        { id: "m_flash", name: "deepseek-v4-flash", model_type: "text", context_tokens: 131072 },
+        { id: "m_pro", name: "deepseek-v4-pro", model_type: "text", context_tokens: 131072 },
       ],
     },
   ],
   chat_model: { provider_id: "deepseek", model_id: "m_flash" },
   image_model: null,
-  video_model_t2v: null,
-  video_model_i2v: null,
-  video_model_r2v: null,
 };
 
 function emptyDraft(): ChatDraft {
@@ -110,6 +102,7 @@ function emptyDraft(): ChatDraft {
     content: "",
     searchItems: [],
     artifacts: [],
+    steps: [],
     searchProvider: null,
     error: null,
   };
@@ -129,8 +122,6 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [drafts, setDrafts] = useState<Record<number, ChatDraft>>({});
-  /** 各会话的异步生成任务（视频）：pending 在会话底部展示任务卡片 */
-  const [jobs, setJobs] = useState<Record<number, Job[]>>({});
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const toastSeqRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -182,40 +173,6 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  /** 合并/更新一个任务（按 id 去重） */
-  const upsertJob = useCallback((cid: number, job: Job) => {
-    setJobs((prev) => ({
-      ...prev,
-      [cid]: [...(prev[cid] ?? []).filter((j) => j.id !== job.id), job].sort(
-        (a, b) => a.id - b.id
-      ),
-    }));
-  }, []);
-
-  /** 拉取某会话任务列表（同时触发后端恢复重启前未完成的任务轮询）。
-   *  与事件推送合并：事件更新（较新）优先于快照中过期的 pending 状态，
-   *  避免"任务刚完成就被旧快照覆盖回生成中"的竞态 */
-  const reloadJobs = useCallback(async (id: number) => {
-    try {
-      const list = await listJobs(id);
-      setJobs((prev) => {
-        const old = prev[id] ?? [];
-        const merged = list.map((s) => {
-          const o = old.find((j) => j.id === s.id);
-          // 事件已将任务推进到终态（done/failed/canceled）而快照仍为 pending：以事件为准
-          if (o && o.status !== "pending" && s.status === "pending") return o;
-          return s;
-        });
-        for (const o of old) {
-          if (!merged.some((m) => m.id === o.id)) merged.push(o);
-        }
-        return { ...prev, [id]: merged.sort((a, b) => a.id - b.id) };
-      });
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
   const activeConversation = useMemo(
     () => conversations.find((c) => c.id === activeId) ?? null,
     [conversations, activeId]
@@ -233,9 +190,6 @@ export default function App() {
         if (!mounted) return;
         setConversations(state.conversations);
         setSettings({ ...DEFAULT_SETTINGS, ...state.settings });
-        // 启动时恢复各会话未完成的任务（含重启前的视频任务），
-        // 使侧边栏徽标与完成通知可跨重启持续
-        state.conversations.forEach((c) => reloadJobs(c.id));
       })
       .catch((e) => showError(`初始化失败: ${e}`));
     return () => {
@@ -326,16 +280,23 @@ export default function App() {
             next = { ...cur, searchItems: [...cur.searchItems, payload.item] };
           }
           break;
+        case "tool_step":
+          // 执行时间线步骤（思考/工具调用完成）：payload.text 为 ToolStep JSON
+          if (payload.text) {
+            try {
+              const step = JSON.parse(payload.text) as ToolStep;
+              next = { ...cur, steps: [...cur.steps, step] };
+            } catch {
+              /* 忽略无法解析的步骤 */
+            }
+          }
+          break;
         case "artifact":
           if (payload.item && "path" in payload.item) {
             next = { ...cur, artifacts: [...cur.artifacts, payload.item as Artifact] };
           }
           break;
         case "permission_request":
-        case "video_submitted":
-        case "video_done":
-        case "video_failed":
-        case "job_canceled":
         case "stopped":
           // 非流式事件：不创建/保留空 draft，避免完成后凭空出现空白气泡
           return prev;
@@ -376,30 +337,6 @@ export default function App() {
       // 与后端 90 秒超时保持一致：超时后自动关闭弹窗，避免悬挂
       window.setTimeout(() => setPermRequest(null), 90000);
     }
-    if (payload.kind === "video_done") {
-      if (payload.job) upsertJob(cid, payload.job);
-      const name = payload.job?.artifact?.name
-        ?? (payload.item && "path" in payload.item ? (payload.item as Artifact).name : "");
-      pushToast("success", `视频已生成${name ? `：${name}` : ""}`);
-      // 统一刷新会话列表，保证侧边栏时间/排序与完成时间一致
-      reloadConversations();
-      if (activeIdRef.current === cid) {
-        reloadMessages(cid);
-        refreshContext(cid);
-      }
-    }
-    if (payload.kind === "video_submitted") {
-      if (payload.job) upsertJob(cid, payload.job);
-      pushToast("info", "视频任务已提交，正在后台生成…");
-    }
-    if (payload.kind === "video_failed") {
-      if (payload.job) upsertJob(cid, payload.job);
-      pushToast("error", payload.text ?? "视频生成失败");
-    }
-    if (payload.kind === "job_canceled") {
-      if (payload.job) upsertJob(cid, payload.job);
-      pushToast("info", "视频任务已取消");
-    }
     if (payload.kind === "stopped") {
       // 用户主动停止：非错误。先等持久化的部分内容加载回来，再移除流式气泡，
       // 避免已生成内容短暂闪现消失；加载失败时保留气泡（内容仍在，可稍后恢复）
@@ -439,7 +376,7 @@ export default function App() {
         }
       }
     },
-    [reloadConversations, reloadMessages, refreshContext, showError, pushToast, upsertJob]
+    [reloadConversations, reloadMessages, refreshContext, showError, pushToast]
   );
 
   useEffect(() => {
@@ -463,10 +400,9 @@ export default function App() {
         return rest;
       });
       reloadMessages(id);
-      reloadJobs(id);
       refreshContext(id);
     },
-    [reloadMessages, reloadJobs, refreshContext]
+    [reloadMessages, refreshContext]
   );
 
   const newConversation = useCallback(async () => {
@@ -504,10 +440,6 @@ export default function App() {
       }
       setConversations((prev) => prev.filter((c) => c.id !== id));
       setDrafts((prev) => {
-        const { [id]: _removed, ...rest } = prev;
-        return rest;
-      });
-      setJobs((prev) => {
         const { [id]: _removed, ...rest } = prev;
         return rest;
       });
@@ -549,6 +481,7 @@ export default function App() {
         reasoning: "",
         search_results: [],
         artifacts: [],
+        steps: [],
         attachments: attachments.map((a) => ({
           name: a.name,
           mime: a.mime,
@@ -627,7 +560,7 @@ export default function App() {
         const abs = await getArtifactAbsPath(convId, artifact.path);
         if (seq !== previewSeqRef.current) return;
         setPreview({
-          kind: artifact.kind as "image" | "video",
+          kind: artifact.kind as "image",
           url: convertFileSrc(abs),
           title: artifact.name,
           html: "",
@@ -664,6 +597,7 @@ export default function App() {
         reasoning: "",
         search_results: [],
         artifacts: [],
+        steps: [],
         attachments: attachments.map((a) => ({
           name: a.name,
           mime: a.mime,
@@ -746,7 +680,6 @@ export default function App() {
       setActiveId(null);
       setMessages([]);
       setDrafts({});
-      setJobs({});
       setContext(null);
       setEditTarget(null);
       setPreview(null);
@@ -756,28 +689,11 @@ export default function App() {
     }
   }, []);
 
-  /** 各会话进行中任务数量（侧边栏"生成中"徽标） */
-  const pendingJobCounts = useMemo(() => {
-    const m: Record<number, number> = {};
-    for (const [cid, list] of Object.entries(jobs)) {
-      const n = list.filter((j) => j.status === "pending").length;
-      if (n > 0) m[Number(cid)] = n;
-    }
-    return m;
-  }, [jobs]);
-
-  /** 当前会话任务列表（引用稳定，配合 MessageItem 的 memo 避免流式期间全量重渲染） */
-  const activeJobs = useMemo(
-    () => (activeId ? (jobs[activeId] ?? []) : []),
-    [jobs, activeId]
-  );
-
   return (
     <div className="app">
       <Sidebar
         conversations={conversations}
         activeId={activeId}
-        pendingJobs={pendingJobCounts}
         onSelect={selectConversation}
         onNew={newConversation}
         onDelete={removeConversation}
@@ -789,7 +705,6 @@ export default function App() {
         messages={messages}
         loadingMessages={loadingMessages}
         draft={activeDraft}
-        jobs={activeJobs}
         context={context}
         onNewConversation={newConversation}
         previewOpen={previewOpen}

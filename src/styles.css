@@ -473,12 +473,6 @@ textarea::placeholder {
   object-fit: contain;
 }
 
-.web-panel-media video {
-  max-width: 100%;
-  max-height: 100%;
-  border-radius: 8px;
-}
-
 /* 模式选择（上拉菜单） */
 .mode-select-wrap {
   position: relative;
@@ -789,7 +783,7 @@ textarea::placeholder {
   display: flex;
   max-width: 860px;
   margin: 0 auto;
-  padding: 12px 20px;
+  padding: 14px 20px;
   gap: 12px;
 }
 
@@ -835,9 +829,17 @@ textarea::placeholder {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 6px;
   font-size: 11px;
   color: var(--text-muted);
+  /* 时间淡化 + 操作按钮隐藏：降低常驻视觉噪音，悬停消息时完整显示 */
+  opacity: 0.55;
+  transition: opacity 0.15s;
+}
+
+.msg:hover .msg-meta,
+.msg:focus-within .msg-meta {
+  opacity: 1;
 }
 
 .msg.user .msg-meta {
@@ -851,6 +853,13 @@ textarea::placeholder {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.msg:hover .msg-action,
+.msg-action:focus-visible {
+  opacity: 1;
 }
 
 .msg-action:hover {
@@ -874,7 +883,7 @@ textarea::placeholder {
   background: var(--bg-subtle);
   border-radius: 999px;
   padding: 4px 10px;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 
 .status-chip.thinking {
@@ -931,9 +940,8 @@ textarea::placeholder {
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
 }
 
-/* 图片/视频：缩略图卡片 */
-.artifact-card.image,
-.artifact-card.video {
+/* 图片：缩略图卡片 */
+.artifact-card.image {
   width: 172px;
   display: flex;
   flex-direction: column;
@@ -963,32 +971,6 @@ textarea::placeholder {
   justify-content: center;
 }
 
-.artifact-play-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.18);
-  transition: background 0.15s;
-}
-
-.artifact-card:hover .artifact-play-overlay {
-  background: rgba(0, 0, 0, 0.32);
-}
-
-.artifact-play-btn {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.92);
-  color: #111;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
-}
-
 .artifact-card-footer {
   display: flex;
   align-items: center;
@@ -1010,16 +992,8 @@ textarea::placeholder {
   color: #2b6dbd;
 }
 
-.artifact-card.video .artifact-badge {
-  color: #b45309;
-}
-
 [data-theme="dark"] .artifact-card.image .artifact-badge {
   color: #7db1ff;
-}
-
-[data-theme="dark"] .artifact-card.video .artifact-badge {
-  color: #fbbf24;
 }
 
 /* 文件：名称芯片 */
@@ -1074,20 +1048,169 @@ textarea::placeholder {
   }
 }
 
-/* 搜索卡片 */
-.search-cards {
+/* ============ 执行过程时间线 ============ */
+/* 思考与各次工具调用按发生顺序展示：外层折叠块 + 步骤列表（左线 + 圆点） */
+.steps-timeline {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   margin-bottom: 10px;
+  overflow: hidden;
 }
 
-.search-cards-label {
+.timeline-toggle {
   display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 11.5px;
+  gap: 6px;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--text-muted);
-  margin-bottom: 6px;
+  width: 100%;
+  text-align: left;
 }
 
+.timeline-toggle svg {
+  transition: transform 0.2s;
+  color: var(--text-muted);
+}
+
+.steps-timeline:not(.open) .timeline-toggle svg {
+  transform: rotate(-90deg);
+}
+
+.timeline-toggle:hover {
+  color: var(--text);
+}
+
+.timeline-list {
+  list-style: none;
+  margin: 0;
+  padding: 2px 12px 10px;
+}
+
+.timeline-step {
+  position: relative;
+  padding-left: 20px;
+}
+
+/* 时间线竖线与节点圆点 */
+.timeline-step::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 14px;
+  bottom: -6px;
+  width: 1px;
+  background: var(--border-strong);
+}
+
+.timeline-step:last-child::before {
+  display: none;
+}
+
+.timeline-step::after {
+  content: "";
+  position: absolute;
+  left: 1px;
+  top: 7px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--bg-subtle);
+  border: 2px solid var(--text-muted);
+}
+
+.timeline-step.kind-search::after {
+  border-color: var(--accent);
+}
+
+.timeline-step.kind-image::after {
+  border-color: #7c5cff;
+}
+
+.timeline-step-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  width: 100%;
+  text-align: left;
+  min-width: 0;
+}
+
+.timeline-step-head.clickable:hover {
+  color: var(--text);
+}
+
+.timeline-step-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.timeline-step.kind-search .timeline-step-icon {
+  color: var(--accent);
+}
+
+.timeline-step.kind-image .timeline-step-icon {
+  color: #7c5cff;
+}
+
+.timeline-step.kind-reasoning .timeline-step-icon {
+  color: #b45309;
+}
+
+[data-theme="dark"] .timeline-step.kind-reasoning .timeline-step-icon {
+  color: #fbbf24;
+}
+
+.timeline-step-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-dur {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-step-chevron {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  transition: transform 0.2s;
+}
+
+.timeline-step-chevron:not(.open) {
+  transform: rotate(-90deg);
+}
+
+/* 步骤详情：思考全文 / 搜索来源卡片 */
+.timeline-detail {
+  padding: 4px 0 8px;
+  min-width: 0;
+}
+
+.timeline-detail.thinking-text {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-muted);
+  max-height: 260px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 搜索来源卡片（时间线步骤详情内横向滚动） */
 .search-cards-row {
   display: flex;
   gap: 8px;
@@ -1135,56 +1258,16 @@ textarea::placeholder {
   text-overflow: ellipsis;
 }
 
-/* 思考过程折叠块（内联于正文之前，弱化样式，不抢占正文位置） */
-.thinking-block {
-  background: var(--bg-subtle);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  margin-bottom: 10px;
-  overflow: hidden;
-}
-
-.thinking-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 12px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-muted);
-  width: 100%;
-  text-align: left;
-}
-
-.thinking-toggle svg {
-  transition: transform 0.2s;
-  color: var(--text-muted);
-}
-
-.thinking-block:not(.open) .thinking-toggle svg {
-  transform: rotate(-90deg);
-}
-
-.thinking-toggle:hover {
-  color: var(--text);
-}
-
-.thinking-content {
-  padding: 2px 12px 12px;
-  font-size: 12.5px;
-  line-height: 1.7;
-  color: var(--text-muted);
-  max-height: 260px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
 /* ============ Markdown ============ */
 .markdown-body {
   font-size: 14.5px;
   line-height: 1.75;
   word-break: break-word;
+}
+
+/* 尾部不留多余下边距：与产物卡片/操作行间距由外层统一控制 */
+.markdown-body > :last-child {
+  margin-bottom: 0;
 }
 
 .markdown-body.streaming .cursor {
@@ -2216,12 +2299,6 @@ textarea::placeholder {
   color: var(--text-muted);
 }
 
-.protocol-chip.anthropic {
-  color: #4d6bfe;
-  border-color: rgba(77, 107, 254, 0.4);
-  background: rgba(77, 107, 254, 0.08);
-}
-
 .protocol-chip.openai {
   color: #7c3aed;
   border-color: rgba(124, 58, 237, 0.4);
@@ -2314,12 +2391,6 @@ textarea::placeholder {
   background: rgba(124, 58, 237, 0.08);
 }
 
-.type-chip.video {
-  color: #0891b2;
-  border-color: rgba(8, 145, 178, 0.4);
-  background: rgba(8, 145, 178, 0.08);
-}
-
 .type-chip.vision {
   color: #059669;
   border-color: rgba(5, 150, 105, 0.4);
@@ -2333,15 +2404,6 @@ textarea::placeholder {
   color: inherit;
   outline: none;
   cursor: pointer;
-}
-
-.video-api-select {
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text-secondary);
 }
 
 .model-add-form {
@@ -2370,99 +2432,6 @@ textarea::placeholder {
   background: rgba(180, 83, 9, 0.08);
   border: 1px solid rgba(180, 83, 9, 0.25);
   border-radius: 20px;
-}
-
-/* ============ 异步任务卡片（视频生成中 / 失败） ============ */
-.job-cards {
-  max-width: 860px;
-  margin: 0 auto 12px;
-  padding: 0 20px 0 62px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.job-card {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  border-radius: 10px;
-  padding: 10px 12px;
-  animation: job-in 0.25s ease;
-}
-
-@keyframes job-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-.job-card-icon {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  color: var(--accent);
-  margin-top: 1px;
-}
-
-.job-card.pending .dot-pulse {
-  color: var(--accent);
-}
-
-.job-card.failed .job-card-icon {
-  color: #dc2626;
-}
-
-.job-card-main {
-  min-width: 0;
-  flex: 1;
-}
-
-.job-card-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.job-card-sub {
-  font-size: 11.5px;
-  color: var(--text-muted);
-  margin-top: 2px;
-  line-height: 1.5;
-  word-break: break-word;
-}
-
-/* ============ 任务完成横条（异步完成总结消息） ============ */
-.job-banner {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  font-weight: 600;
-  color: #15803d;
-  background: rgba(21, 128, 61, 0.08);
-  border: 1px solid rgba(21, 128, 61, 0.22);
-  border-radius: 999px;
-  padding: 4px 12px;
-  margin-bottom: 10px;
-}
-
-[data-theme="dark"] .job-banner {
-  color: #4ade80;
-  background: rgba(74, 222, 128, 0.1);
-  border-color: rgba(74, 222, 128, 0.25);
-}
-
-.job-banner-detail {
-  font-weight: 400;
-  color: var(--text-muted);
 }
 
 /* ============ 右上角堆叠通知 Toast ============ */
@@ -2553,25 +2522,6 @@ textarea::placeholder {
 .toast-close:hover {
   color: var(--text);
   background: var(--bg-subtle);
-}
-
-/* ============ 侧边栏"生成中"徽标 ============ */
-.conv-pending {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 10.5px;
-  color: var(--accent);
-  background: var(--accent-soft);
-  border-radius: 999px;
-  padding: 2px 8px;
-  margin-left: 6px;
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
-.conv-pending .dot-pulse {
-  color: var(--accent);
 }
 
 /* 附件图片加载占位（解析绝对路径期间） */

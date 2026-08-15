@@ -58,11 +58,6 @@ export function WebPreviewPanel({
             <img src={preview.url} alt={preview.title} />
           </div>
         )}
-        {!loading && !error && preview && preview.kind === "video" && (
-          <div className="web-panel-media">
-            <video src={preview.url} controls autoPlay />
-          </div>
-        )}
         {!loading && !error && preview && (preview.kind === "web" || preview.kind === "file") && (
           <iframe
             className="web-panel-frame"

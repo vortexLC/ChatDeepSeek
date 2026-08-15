@@ -6,7 +6,6 @@ import type {
   ModelSelection,
   ModelType,
   ProviderConfig,
-  VideoApi,
 } from "../types";
 import { testModel } from "../api";
 import { ChevronDownIcon, TrashIcon } from "./icons";
@@ -24,7 +23,6 @@ const TYPE_LABEL: Record<ModelType, string> = {
   text: "文本（无视觉）",
   vision: "多模态（视觉）",
   image: "图片生成",
-  video: "视频生成",
 };
 
 const SELECT_KEY_SEP = "\u0000";
@@ -65,9 +63,6 @@ function cleanSelections(s: AppSettings, providers: ProviderConfig[]): AppSettin
     ...s,
     chat_model: keep(s.chat_model, ["text", "vision"]),
     image_model: keep(s.image_model, ["image"]),
-    video_model_t2v: keep(s.video_model_t2v, ["video"]),
-    video_model_i2v: keep(s.video_model_i2v, ["video"]),
-    video_model_r2v: keep(s.video_model_r2v, ["video"]),
   };
 }
 
@@ -113,7 +108,6 @@ export function SettingsPanel({
   const [addingModelFor, setAddingModelFor] = useState<string | null>(null);
   const [newModelName, setNewModelName] = useState("");
   const [newModelType, setNewModelType] = useState<ModelType>("text");
-  const [newModelVideoApi, setNewModelVideoApi] = useState<VideoApi>("auto");
   const [newModelContextK, setNewModelContextK] = useState(128);
   const [modelFormError, setModelFormError] = useState<string | null>(null);
   // 模型测试
@@ -130,7 +124,6 @@ export function SettingsPanel({
       setCollapsed({});
       setAddingModelFor(null);
       setNewModelName("");
-      setNewModelVideoApi("auto");
       setNewModelContextK(128);
       setModelFormError(null);
       setTestResults({});
@@ -210,7 +203,6 @@ export function SettingsPanel({
       id: `m_${Date.now()}`,
       name,
       model_type: newModelType,
-      video_api: newModelType === "video" ? newModelVideoApi : "auto",
       context_tokens:
         newModelType === "text" || newModelType === "vision"
           ? newModelContextK * 1000
@@ -243,15 +235,12 @@ export function SettingsPanel({
   // ---------- 模型选择 ----------
   const chatModels: { p: ProviderConfig; m: ModelConfig }[] = [];
   const imageModels: { p: ProviderConfig; m: ModelConfig }[] = [];
-  const videoModels: { p: ProviderConfig; m: ModelConfig }[] = [];
   for (const p of draft.providers) {
     for (const m of p.models) {
       if (m.model_type === "text" || m.model_type === "vision") {
         chatModels.push({ p, m });
       } else if (m.model_type === "image") {
         imageModels.push({ p, m });
-      } else if (m.model_type === "video") {
-        videoModels.push({ p, m });
       }
     }
   }
@@ -381,11 +370,8 @@ export function SettingsPanel({
                       set("default_mode", e.target.value as AppSettings["default_mode"])
                     }
                   >
-                    <option value="chat">Chat（普通对话）</option>
-                    <option value="image">Image（+ 图片生成）</option>
-                    <option value="video">Video（+ 视频生成）</option>
-                    <option value="build">Build（编程工具）</option>
-                    <option value="agent">Agent（全部工具）</option>
+                    <option value="chat">Chat（普通对话 + 图片生成）</option>
+                    <option value="agent">Agent（编程工具 + 联网搜索 + 图片生成）</option>
                   </select>
                 </Field>
 
@@ -453,7 +439,7 @@ export function SettingsPanel({
                         />
                         <span className="provider-card-name">{p.name || "(未命名)"}</span>
                         <span className={`protocol-chip ${p.protocol}`}>
-                          {p.protocol === "anthropic" ? "Anthropic" : "OpenAI 兼容"}
+                          OpenAI 兼容
                         </span>
                         <span className="provider-models-count">
                           {p.models.length} 个模型
@@ -488,21 +474,13 @@ export function SettingsPanel({
                                 }
                               />
                             </Field>
-                            <Field label="API 协议" hint="DeepSeek 官方为 Anthropic；其它大多为 OpenAI 兼容">
-                              <select
-                                value={p.protocol}
-                                onChange={(e) =>
-                                  updateProvider(p.id, {
-                                    protocol: e.target.value as ProviderConfig["protocol"],
-                                  })
-                                }
-                              >
-                                <option value="openai">OpenAI 兼容（chat/completions）</option>
-                                <option value="anthropic">Anthropic Messages</option>
-                              </select>
+                            <Field label="API 协议" hint="仅支持 OpenAI 兼容接口（chat/completions）">
+                              <div className="field-static">
+                                <span className="chip">OpenAI 兼容</span>
+                              </div>
                             </Field>
                           </div>
-                          <Field label="API Base URL" hint="如 https://api.deepseek.com/anthropic 或 https://api.siliconflow.cn/v1">
+                          <Field label="API Base URL" hint="如 https://api.deepseek.com/v1 或 https://api.siliconflow.cn/v1">
                             <input
                               type="text"
                               value={p.api_base}
@@ -556,22 +534,6 @@ export function SettingsPanel({
                                       K
                                     </label>
                                   )}
-                                  {m.model_type === "video" && (
-                                    <select
-                                      className="video-api-select"
-                                      value={m.video_api}
-                                      title="视频生成接口风格"
-                                      onChange={(e) =>
-                                        updateModel(p.id, m.id, {
-                                          video_api: e.target.value as VideoApi,
-                                        })
-                                      }
-                                    >
-                                      <option value="auto">接口：自动</option>
-                                      <option value="siliconflow">接口：硅基流动</option>
-                                      <option value="dashscope">接口：阿里云百炼</option>
-                                    </select>
-                                  )}
                                   {m.model_type === "text" || m.model_type === "vision" ? (
                                     <span className="type-chip type-select">
                                       <select
@@ -598,10 +560,7 @@ export function SettingsPanel({
                                           })
                                         }
                                       >
-                                        <option value="text">文本（无视觉）</option>
-                                        <option value="vision">多模态（视觉）</option>
                                         <option value="image">图片生成</option>
-                                        <option value="video">视频生成</option>
                                       </select>
                                     </span>
                                   )}
@@ -641,7 +600,7 @@ export function SettingsPanel({
                                       onChange={(e) => setNewModelName(e.target.value)}
                                     />
                                   </Field>
-                                  <Field label="模型类型" hint="测试方式随类型不同（文本发消息、图片生图、视频检查认证）">
+                                  <Field label="模型类型" hint="测试方式随类型不同（文本发消息、图片生图）">
                                     <select
                                       value={newModelType}
                                       onChange={(e) =>
@@ -651,24 +610,10 @@ export function SettingsPanel({
                                       <option value="text">文本（无视觉）</option>
                                       <option value="vision">多模态（视觉）</option>
                                       <option value="image">图片生成</option>
-                                      <option value="video">视频生成</option>
                                     </select>
                                   </Field>
                                 </div>
-                                {newModelType === "video" ? (
-                                  <Field label="视频接口风格" hint="自动：按服务商地址与模型名推断">
-                                    <select
-                                      value={newModelVideoApi}
-                                      onChange={(e) =>
-                                        setNewModelVideoApi(e.target.value as VideoApi)
-                                      }
-                                    >
-                                      <option value="auto">自动</option>
-                                      <option value="siliconflow">硅基流动（/video/submit）</option>
-                                      <option value="dashscope">阿里云百炼（video-synthesis）</option>
-                                    </select>
-                                  </Field>
-                                ) : newModelType === "text" || newModelType === "vision" ? (
+                                {newModelType === "text" || newModelType === "vision" ? (
                                   <Field label="上下文容量" hint="仅对话/多模态模型需要：上下文窗口大小（千 token），影响上下文自动压缩时机">
                                     <input
                                       type="number"
@@ -713,7 +658,6 @@ export function SettingsPanel({
                                   setAddingModelFor(p.id);
                                   setNewModelName("");
                                   setNewModelType("text");
-                                  setNewModelVideoApi("auto");
                                   setNewModelContextK(128);
                                   setModelFormError(null);
                                 }}
@@ -732,13 +676,12 @@ export function SettingsPanel({
                 </button>
                 <Field
                   label="说明"
-                  hint="对话模型：文本/多模态模型用于聊天；图片生成/视频生成模型用于 Image / Video / Agent 模式中的 AI 生成功能。添加后到「模型选择」页指定用途；对话模型的上下文容量决定上下文进度与自动压缩时机。"
+                  hint="对话模型：文本/多模态模型用于聊天；图片生成模型用于 Chat / Agent 模式中的 AI 绘画功能。添加后到「模型选择」页指定用途；对话模型的上下文容量决定上下文进度与自动压缩时机。"
                 >
                   <div className="field-static">
                     <span className="chip">文本</span>
                     <span className="chip">多模态</span>
                     <span className="chip">图片生成</span>
-                    <span className="chip">视频生成</span>
                   </div>
                 </Field>
               </>
@@ -756,38 +699,14 @@ export function SettingsPanel({
                 )}
                 {selectionField(
                   "图片生成模型",
-                  "Image / Agent 模式中生成图片使用",
+                  "Chat / Agent 模式中生成图片使用",
                   imageModels,
                   draft.image_model,
                   (sel) => set("image_model", sel)
                 )}
-                {selectionField(
-                  "文生视频模型",
-                  "Video / Agent 模式中文字生成视频使用",
-                  videoModels,
-                  draft.video_model_t2v,
-                  (sel) => set("video_model_t2v", sel)
-                )}
-                {selectionField(
-                  "图生视频模型",
-                  "Video / Agent 模式中基于图片（作为首帧）生成视频使用",
-                  videoModels,
-                  draft.video_model_i2v,
-                  (sel) => set("video_model_i2v", sel)
-                )}
-                {selectionField(
-                  "参考生视频模型",
-                  "Video / Agent 模式中参考图片 + 提示词生成视频使用（需 r2v 模型，如阿里云百炼 wan2.7-r2v / wan2.6-r2v）",
-                  videoModels,
-                  draft.video_model_r2v,
-                  (sel) => set("video_model_r2v", sel)
-                )}
-                <Field label="模式说明" hint="Image 模式 = Chat + 图片生成；Video 模式 = Chat + 视频生成；Build = 编程工具（沙箱）；Agent = 全部工具">
+                <Field label="模式说明" hint="Chat 模式 = 普通对话 + 图片生成；Agent 模式 = 编程工具（沙箱）+ 联网搜索 + 图片生成">
                   <div className="field-static">
                     <span className="chip">Chat</span>
-                    <span className="chip">Image</span>
-                    <span className="chip">Video</span>
-                    <span className="chip">Build</span>
                     <span className="chip">Agent</span>
                   </div>
                 </Field>

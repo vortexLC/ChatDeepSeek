@@ -1,25 +1,23 @@
-export type Provider = "openai" | "anthropic";
+export type Provider = "openai";
 export type Effort = "none" | "low" | "high" | "max";
 export type ThemeMode = "auto" | "light" | "dark";
 export type SearchStrategy = "auto" | "tavily" | "anysearch";
 
-export type AgentMode = "chat" | "image" | "video" | "build" | "agent";
+export type AgentMode = "chat" | "agent";
 
-export type ModelType = "text" | "vision" | "image" | "video";
-export type VideoApi = "auto" | "siliconflow" | "dashscope";
+export type ModelType = "text" | "vision" | "image";
 
 export interface ModelConfig {
   id: string;
   name: string;
   model_type: ModelType;
-  video_api: VideoApi;
   context_tokens: number;
 }
 
 export interface ProviderConfig {
   id: string;
   name: string;
-  protocol: "openai" | "anthropic";
+  protocol: "openai";
   api_base: string;
   api_key: string;
   models: ModelConfig[];
@@ -68,26 +66,20 @@ export interface SearchItem {
 }
 
 export interface Artifact {
-  kind: "image" | "video" | "file";
+  kind: "image" | "file";
   name: string;
   path: string;
   size: number;
   note: string;
 }
 
-/** 异步生成任务（如视频）：提交后展示"生成中"，完成后展示结果 */
-export interface Job {
-  id: number;
-  conversation_id: number;
-  kind: "video" | "image";
-  api: string;
-  model: string;
-  request_id: string;
-  status: "pending" | "done" | "failed" | "canceled";
-  submitted_at: number;
-  finished_at: number;
-  error: string;
-  artifact: Artifact | null;
+/** 执行时间线步骤：深度思考 / 工具调用，按发生顺序展示 */
+export interface ToolStep {
+  kind: "reasoning" | "search" | "tool" | "image";
+  label: string;
+  tool: string;
+  duration_ms: number;
+  items: SearchItem[];
 }
 
 export interface Message {
@@ -99,7 +91,7 @@ export interface Message {
   search_results: SearchItem[];
   artifacts: Artifact[];
   attachments: Attachment[];
-  job_id?: number | null;
+  steps: ToolStep[];
   created_at: number;
 }
 
@@ -120,16 +112,12 @@ export interface SiliconFlowGenSettings {
   api_key: string;
   base_url: string;
   image_model: string;
-  video_model_i2v: string;
-  video_model_t2v: string;
 }
 
 export interface AlibabaGenSettings {
   api_key: string;
   base_url: string;
   image_model: string;
-  video_model_i2v: string;
-  video_model_t2v: string;
 }
 
 export interface GenSettings {
@@ -151,9 +139,6 @@ export interface AppSettings {
   providers: ProviderConfig[];
   chat_model: ModelSelection | null;
   image_model: ModelSelection | null;
-  video_model_t2v: ModelSelection | null;
-  video_model_i2v: ModelSelection | null;
-  video_model_r2v: ModelSelection | null;
 }
 
 export type ChatStatus =
@@ -170,6 +155,7 @@ export interface ChatDraft {
   content: string;
   searchItems: SearchItem[];
   artifacts: Artifact[];
+  steps: ToolStep[];
   searchProvider: string | null;
   error: string | null;
 }
@@ -180,12 +166,9 @@ export interface ChatEventPayload {
     | "reasoning_delta"
     | "content_delta"
     | "search_result"
+    | "tool_step"
     | "artifact"
     | "permission_request"
-    | "video_submitted"
-    | "video_done"
-    | "video_failed"
-    | "job_canceled"
     | "stopped"
     | "done"
     | "error";
@@ -196,7 +179,6 @@ export interface ChatEventPayload {
   tool?: string;
   path?: string;
   search_provider?: "tavily" | "anysearch" | null;
-  job?: Job;
 }
 
 export interface PermissionRequest {
@@ -233,7 +215,7 @@ export interface EditTarget {
 }
 
 export interface PreviewContent {
-  kind: "web" | "file" | "image" | "video";
+  kind: "web" | "file" | "image";
   url: string;
   title: string;
   html: string;

@@ -7,7 +7,6 @@ import type {
   ContextStatus,
   Conversation,
   Effort,
-  Job,
   Message,
   ModelConfig,
   ProviderConfig,
@@ -53,10 +52,6 @@ export async function deleteConversation(id: number): Promise<void> {
 
 export async function getMessages(id: number): Promise<Message[]> {
   return invoke("get_messages", { id });
-}
-
-export async function listJobs(conversationId: number): Promise<Job[]> {
-  return invoke("list_jobs", { conversationId });
 }
 
 export async function getContextStatus(id: number): Promise<ContextStatus> {

@@ -7,21 +7,17 @@ import type {
   Conversation,
   EditTarget,
   Effort,
-  Job,
   Message,
   ModelOption,
   UploadAttachment,
 } from "../types";
-import { MessageItem } from "./MessageItem";
+import { MessageItem, StepsTimeline, synthesizeSteps } from "./MessageItem";
 import { InputBar } from "./InputBar";
 import { Markdown } from "./Markdown";
 import { ArtifactCards } from "./ArtifactCards";
-import { JobCards } from "./JobCard";
 import { renderMarkdown } from "../lib/markdown";
 import {
   AlertIcon,
-  ChevronDownIcon,
-  GlobeIcon,
   LinkIcon,
   SearchIcon,
   SparkIcon,
@@ -42,13 +38,6 @@ const SUGGESTIONS = [
   "推荐 3 个适合新手的编程项目",
 ];
 
-function effortOptionsForProtocol(protocol?: string): Effort[] {
-  // 仅 Anthropic 协议会携带推理强度（output_config.effort）；
-  // OpenAI 兼容协议不传该参数，返回空数组以隐藏强度选择
-  if (protocol === "anthropic") return ["low", "high", "max"];
-  return [];
-}
-
 function DraftMessage({
   draft,
   onOpenLink,
@@ -62,7 +51,6 @@ function DraftMessage({
   onOpenFile: (convId: number, path: string, title: string) => void;
   convId: number;
 }) {
-  const [showReasoning, setShowReasoning] = useState(false);
   // 流式渲染节流：高优先级渲染走低优先级延迟值，避免每次 token 全量重渲染长 Markdown；
   // 渲染结果按延迟值缓存，未变化期间不重复解析
   const deferredContent = useDeferredValue(draft.content);
@@ -71,14 +59,22 @@ function DraftMessage({
     [deferredContent]
   );
 
-  useEffect(() => {
-    if (draft.reasoning) setShowReasoning(true);
-  }, [draft.reasoning]);
+  // 时间线步骤：流式事件累积；尚未收到步骤事件时由已到达字段合成（搜索结果实时可见）
+  const draftSteps = useMemo(
+    () =>
+      draft.steps.length
+        ? draft.steps
+        : synthesizeSteps(draft.reasoning, draft.searchItems),
+    [draft.steps, draft.reasoning, draft.searchItems]
+  );
 
+  // 状态 chip：仅在与折叠块/正文不重复时显示。
+  // 已有思考内容时不再显示"正在思考"chip（思考折叠块本身就是状态表达）；
+  // 正文开始输出后不再显示任何 chip（打字机效果即状态）
   const statusChip =
     draft.status === "idle" || (draft.status === "answering" && draft.content.length > 0)
       ? null
-      : draft.status === "thinking" ? (
+      : draft.status === "thinking" && !draft.reasoning ? (
           <span className="status-chip thinking">
             <span className="dot-pulse" />
             正在思考你的问题…
@@ -96,16 +92,14 @@ function DraftMessage({
         ) : draft.status === "analyzing" ? (
           <span className="status-chip analyzing">
             <SparkIcon size={12} />
-            正在分析
             {draft.searchItems.length > 0
-              ? ` ${draft.searchItems.length} 条搜索结果`
-              : "搜索结果"}
-            ，提炼与问题相关的核心事实…
+              ? `正在分析 ${draft.searchItems.length} 条搜索结果…`
+              : "正在处理工具执行结果…"}
           </span>
         ) : draft.status === "generating" ? (
           <span className="status-chip generating">
             <SparkIcon size={12} />
-            正在生成（图片/视频生成可能需要几分钟）…
+            正在生成图片，通常需要十几秒…
           </span>
         ) : (
           <span className="status-chip answering">
@@ -119,45 +113,19 @@ function DraftMessage({
       <div className="msg-avatar">DS</div>
       <div className="msg-body">
         {statusChip}
-        {draft.reasoning && showReasoning && (
-          <div className="thinking-block open">
-            <button
-              className="thinking-toggle"
-              onClick={() => setShowReasoning((v) => !v)}
-            >
-              <ChevronDownIcon size={13} />
-              <span>思考过程</span>
-            </button>
-            <div className="thinking-content">{draft.reasoning}</div>
-          </div>
-        )}
+        <StepsTimeline
+          steps={draftSteps}
+          reasoning={draft.reasoning}
+          onOpenLink={onOpenLink}
+          defaultOpen
+          expandReasoning={!draft.content}
+        />
         {deferredContent && (
           <Markdown
             className="markdown-body streaming"
             html={contentHtml}
             onOpenLink={onOpenLink}
           />
-        )}
-        {draft.searchItems.length > 0 && (
-          <div className="search-cards">
-            <div className="search-cards-label">
-              <GlobeIcon size={12} />
-              联网搜索结果
-            </div>
-            <div className="search-cards-row">
-              {draft.searchItems.map((it, i) => (
-                <button
-                  key={`${it.url}-${i}`}
-                  className="search-card"
-                  onClick={() => onOpenLink(it.url)}
-                  title={it.url}
-                >
-                  <span className="search-card-title">{it.title || it.url}</span>
-                  <span className="search-card-url">{it.url}</span>
-                </button>
-              ))}
-            </div>
-          </div>
         )}
         <ArtifactCards
           artifacts={draft.artifacts}
@@ -175,7 +143,6 @@ interface ChatViewProps {
   messages: Message[];
   loadingMessages: boolean;
   draft: ChatDraft | null;
-  jobs: Job[];
   context: ContextStatus | null;
   onNewConversation: () => void;
   previewOpen: boolean;
@@ -203,7 +170,6 @@ export function ChatView({
   messages,
   loadingMessages,
   draft,
-  jobs,
   context,
   onNewConversation,
   previewOpen,
@@ -248,7 +214,6 @@ export function ChatView({
     draft?.status,
     draft?.searchItems,
     draft?.artifacts,
-    jobs.length,
   ]);
 
   if (!conversation) {
@@ -324,7 +289,6 @@ export function ChatView({
           <MessageItem
             key={m.id}
             message={m}
-            jobs={jobs}
             onOpenLink={onOpenLink}
             onOpenFile={onOpenFile}
             onOpenArtifact={onOpenArtifact}
@@ -340,7 +304,6 @@ export function ChatView({
             convId={conversation.id}
           />
         )}
-        <JobCards jobs={jobs} />
       </div>
 
       {context && !contextDismissed && (context.full || context.near_full) && (
@@ -385,9 +348,7 @@ export function ChatView({
         webSearch={conversation.web_search}
         deepThink={conversation.deep_think}
         effort={conversation.effort}
-        effortOptions={effortOptionsForProtocol(
-          modelOptions.find((o) => o.model === effectiveModel)?.protocol
-        )}
+        effortOptions={[]}
         onToggleWebSearch={onToggleWebSearch}
         onToggleDeepThink={onToggleDeepThink}
         onSetEffort={onSetEffort}

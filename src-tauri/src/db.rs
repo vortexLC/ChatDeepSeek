@@ -22,23 +22,10 @@ CREATE TABLE IF NOT EXISTS messages (
     search_results TEXT NOT NULL DEFAULT '[]',
     artifacts TEXT NOT NULL DEFAULT '[]',
     attachments TEXT NOT NULL DEFAULT '[]',
+    steps TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
-CREATE TABLE IF NOT EXISTS jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id INTEGER NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'video',
-    api TEXT NOT NULL DEFAULT '',
-    model TEXT NOT NULL DEFAULT '',
-    request_id TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending',
-    submitted_at INTEGER NOT NULL,
-    finished_at INTEGER NOT NULL DEFAULT 0,
-    error TEXT NOT NULL DEFAULT '',
-    artifact TEXT NOT NULL DEFAULT 'null'
-);
-CREATE INDEX IF NOT EXISTS idx_jobs_conv ON jobs(conversation_id, id);
 ";
 
 pub fn now_ms() -> i64 {
@@ -77,8 +64,7 @@ pub fn estimate_tokens(text: &str) -> u64 {
 ///           ├── session.json   —— 会话元数据（标题/模型/模式/开关等）
 ///           ├── messages.db    —— 会话内容（消息/思考/工具调用/搜索结果/产物索引）
 ///           ├── files/         —— 文件产物（Build/Agent 模式生成）
-///           ├── images/        —— 图片产物
-///           └── videos/        —— 视频产物
+///           └── images/        —— 图片产物
 pub struct Db {
     session_lock: Mutex<()>,
     /// 按会话缓存 SQLite 连接，避免每次消息操作重复打开数据库
@@ -121,7 +107,6 @@ impl Db {
         let dir = self.session_dir(id);
         let _ = fs::create_dir_all(dir.join("files"));
         let _ = fs::create_dir_all(dir.join("images"));
-        let _ = fs::create_dir_all(dir.join("videos"));
         let _ = fs::create_dir_all(dir.join("uploads"));
     }
 
@@ -186,16 +171,19 @@ impl Db {
                 [],
             );
         }
-        let has_job_id: bool = conn
+        let has_steps: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='job_id'",
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='steps'",
                 [],
                 |r| r.get::<_, i64>(0),
             )
             .map(|n| n > 0)
             .unwrap_or(false);
-        if !has_job_id {
-            let _ = conn.execute("ALTER TABLE messages ADD COLUMN job_id INTEGER", []);
+        if !has_steps {
+            let _ = conn.execute(
+                "ALTER TABLE messages ADD COLUMN steps TEXT NOT NULL DEFAULT '[]'",
+                [],
+            );
         }
         let arc = Arc::new(Mutex::new(conn));
         self.conns.lock().unwrap().insert(id, arc.clone());
@@ -276,7 +264,7 @@ impl Db {
                 .chat_model
                 .as_ref()
                 .map(|s| s.provider_id.clone())
-                .unwrap_or_else(|| "anthropic".into()),
+                .unwrap_or_else(|| "openai".into()),
             model: settings
                 .chat_model
                 .as_ref()
@@ -418,10 +406,6 @@ impl Db {
         self.session_dir(id).join("images")
     }
 
-    pub fn session_videos_dir(&self, id: i64) -> PathBuf {
-        self.session_dir(id).join("videos")
-    }
-
     pub fn session_uploads_dir(&self, id: i64) -> PathBuf {
         self.session_dir(id).join("uploads")
     }
@@ -454,9 +438,11 @@ impl Db {
         let search_results: String = row.get(6)?;
         let artifacts: String = row.get(7)?;
         let attachments: String = row.get(8)?;
+        let steps: String = row.get(9)?;
         let items = serde_json::from_str(&search_results).unwrap_or_default();
         let arts = serde_json::from_str(&artifacts).unwrap_or_default();
         let atts = serde_json::from_str(&attachments).unwrap_or_default();
+        let sts = serde_json::from_str(&steps).unwrap_or_default();
         Ok(Message {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
@@ -466,7 +452,7 @@ impl Db {
             search_results: items,
             artifacts: arts,
             attachments: atts,
-            job_id: row.get(9)?,
+            steps: sts,
             created_at: row.get(5)?,
         })
     }
@@ -476,7 +462,7 @@ impl Db {
         let conn = conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, conversation_id, role, content, reasoning, created_at, search_results, artifacts, attachments, job_id
+                "SELECT id, conversation_id, role, content, reasoning, created_at, search_results, artifacts, attachments, steps
                  FROM messages WHERE conversation_id = ?1 ORDER BY id",
             )
             .map_err(|e| e.to_string())?;
@@ -491,7 +477,7 @@ impl Db {
         let conn = conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, conversation_id, role, content, reasoning, tool_calls, tool_results, search_results, artifacts, attachments, job_id, created_at
+                "SELECT id, conversation_id, role, content, reasoning, tool_calls, tool_results, search_results, artifacts, attachments, steps, created_at
                  FROM messages WHERE conversation_id = ?1 ORDER BY id",
             )
             .map_err(|e| e.to_string())?;
@@ -508,7 +494,7 @@ impl Db {
                     search_results: r.get(7)?,
                     artifacts: r.get(8)?,
                     attachments: r.get(9)?,
-                    job_id: r.get(10)?,
+                    steps: r.get(10)?,
                     created_at: r.get(11)?,
                 })
             })
@@ -520,7 +506,7 @@ impl Db {
         let conn = self.open_session_conn(conv_id).ok()?;
         let conn = conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, conversation_id, role, content, reasoning, tool_calls, tool_results, search_results, artifacts, attachments, job_id, created_at
+            "SELECT id, conversation_id, role, content, reasoning, tool_calls, tool_results, search_results, artifacts, attachments, steps, created_at
              FROM messages WHERE id = ?1 AND conversation_id = ?2",
             params![message_id, conv_id],
             |r| {
@@ -535,7 +521,7 @@ impl Db {
                     search_results: r.get(7)?,
                     artifacts: r.get(8)?,
                     attachments: r.get(9)?,
-                    job_id: r.get(10)?,
+                    steps: r.get(10)?,
                     created_at: r.get(11)?,
                 })
             },
@@ -565,10 +551,11 @@ impl Db {
         tool_results: &str,
         search_results: &[SearchItem],
         artifacts: &[Artifact],
+        steps: &[ToolStep],
     ) -> Result<i64, String> {
         self.insert_message_with_attachments(
             conv_id, role, content, reasoning, tool_calls, tool_results, search_results, artifacts,
-            &[],
+            steps, &[],
         )
     }
 
@@ -583,6 +570,7 @@ impl Db {
         tool_results: &str,
         search_results: &[SearchItem],
         artifacts: &[Artifact],
+        steps: &[ToolStep],
         attachments: &[crate::models::Attachment],
     ) -> Result<i64, String> {
         let conn = self.open_session_conn(conv_id)?;
@@ -590,149 +578,14 @@ impl Db {
         let sr = serde_json::to_string(search_results).unwrap_or_else(|_| "[]".into());
         let ar = serde_json::to_string(artifacts).unwrap_or_else(|_| "[]".into());
         let at = serde_json::to_string(attachments).unwrap_or_else(|_| "[]".into());
+        let st = serde_json::to_string(steps).unwrap_or_else(|_| "[]".into());
         conn.execute(
-            "INSERT INTO messages (conversation_id, role, content, reasoning, tool_calls, tool_results, search_results, artifacts, attachments, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![conv_id, role, content, reasoning, tool_calls, tool_results, sr, ar, at, now_ms()],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// 插入消息并关联异步任务（视频完成消息使用）
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_message_with_job(
-        &self,
-        conv_id: i64,
-        role: &str,
-        content: &str,
-        reasoning: &str,
-        tool_calls: &str,
-        tool_results: &str,
-        search_results: &[SearchItem],
-        artifacts: &[Artifact],
-        attachments: &[crate::models::Attachment],
-        job_id: Option<i64>,
-    ) -> Result<i64, String> {
-        let conn = self.open_session_conn(conv_id)?;
-        let conn = conn.lock().unwrap();
-        let sr = serde_json::to_string(search_results).unwrap_or_else(|_| "[]".into());
-        let ar = serde_json::to_string(artifacts).unwrap_or_else(|_| "[]".into());
-        let at = serde_json::to_string(attachments).unwrap_or_else(|_| "[]".into());
-        conn.execute(
-            "INSERT INTO messages (conversation_id, role, content, reasoning, tool_calls, tool_results, search_results, artifacts, attachments, job_id, created_at)
+            "INSERT INTO messages (conversation_id, role, content, reasoning, tool_calls, tool_results, search_results, artifacts, attachments, steps, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![conv_id, role, content, reasoning, tool_calls, tool_results, sr, ar, at, job_id, now_ms()],
+            params![conv_id, role, content, reasoning, tool_calls, tool_results, sr, ar, at, st, now_ms()],
         )
         .map_err(|e| e.to_string())?;
         Ok(conn.last_insert_rowid())
-    }
-
-    // ==================== 异步生成任务（jobs 表） ====================
-
-    fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<Job> {
-        let artifact_json: String = row.get(10)?;
-        let artifact = serde_json::from_str(&artifact_json).unwrap_or(None);
-        Ok(Job {
-            id: row.get(0)?,
-            conversation_id: row.get(1)?,
-            kind: row.get(2)?,
-            api: row.get(3)?,
-            model: row.get(4)?,
-            request_id: row.get(5)?,
-            status: row.get(6)?,
-            submitted_at: row.get(7)?,
-            finished_at: row.get(8)?,
-            error: row.get(9)?,
-            artifact,
-        })
-    }
-
-    const JOB_COLS: &str = "id, conversation_id, kind, api, model, request_id, status, submitted_at, finished_at, error, artifact";
-
-    pub fn create_job(
-        &self,
-        conv_id: i64,
-        kind: &str,
-        api: &str,
-        model: &str,
-        request_id: &str,
-    ) -> Result<i64, String> {
-        let conn = self.open_session_conn(conv_id)?;
-        let conn = conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO jobs (conversation_id, kind, api, model, request_id, status, submitted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
-            params![conv_id, kind, api, model, request_id, now_ms()],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// 任务完成：记录产物与完成时间（仅 pending 状态可更新，不覆盖已取消任务）
-    pub fn finish_job(&self, conv_id: i64, job_id: i64, artifact: &Artifact) -> Result<(), String> {
-        let conn = self.open_session_conn(conv_id)?;
-        let conn = conn.lock().unwrap();
-        let art = serde_json::to_string(&Some(artifact)).unwrap_or_else(|_| "null".into());
-        conn.execute(
-            "UPDATE jobs SET status = 'done', finished_at = ?1, artifact = ?2 WHERE id = ?3 AND status = 'pending'",
-            params![now_ms(), art, job_id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// 任务失败：记录错误与完成时间（仅 pending 状态可更新）
-    pub fn fail_job(&self, conv_id: i64, job_id: i64, error: &str) -> Result<(), String> {
-        let conn = self.open_session_conn(conv_id)?;
-        let conn = conn.lock().unwrap();
-        conn.execute(
-            "UPDATE jobs SET status = 'failed', finished_at = ?1, error = ?2 WHERE id = ?3 AND status = 'pending'",
-            params![now_ms(), error, job_id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// 将会话内所有未完成任务标记为 canceled（删除/编辑会话时调用）
-    pub fn cancel_jobs_for_session(&self, conv_id: i64) -> Result<(), String> {
-        let conn = self.open_session_conn(conv_id)?;
-        let conn = conn.lock().unwrap();
-        conn.execute(
-            "UPDATE jobs SET status = 'canceled', finished_at = ?1 WHERE conversation_id = ?2 AND status = 'pending'",
-            params![now_ms(), conv_id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn list_jobs(&self, conv_id: i64) -> Result<Vec<Job>, String> {
-        let conn = self.open_session_conn(conv_id)?;
-        let conn = conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {col} FROM jobs WHERE conversation_id = ?1 ORDER BY id",
-                col = Self::JOB_COLS
-            ))
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![conv_id], |r| Self::row_to_job(r))
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
-    }
-
-    pub fn get_job(&self, conv_id: i64, job_id: i64) -> Option<Job> {
-        let conn = self.open_session_conn(conv_id).ok()?;
-        let conn = conn.lock().unwrap();
-        conn.query_row(
-            &format!(
-                "SELECT {col} FROM jobs WHERE id = ?1 AND conversation_id = ?2",
-                col = Self::JOB_COLS
-            ),
-            params![job_id, conv_id],
-            |r| Self::row_to_job(r),
-        )
-        .ok()
     }
 
     // ==================== 设置（json/settings.json） ====================
@@ -770,7 +623,13 @@ impl Db {
         let summarized_until = conv.as_ref().map(|c| c.summarized_until).unwrap_or(0);
         let compressed = !summary.is_empty();
 
-        let mut used: u64 = estimate_tokens(&summary);
+        // 请求固定开销：system prompt + 工具 JSON 定义（Agent 模式更高），
+        // 不计入会低估用量、延迟压缩触发
+        let overhead = match conv.as_ref().map(|c| c.mode.as_str()) {
+            Some("agent") => crate::models::CONTEXT_OVERHEAD_AGENT,
+            _ => crate::models::CONTEXT_OVERHEAD_CHAT,
+        };
+        let mut used: u64 = overhead + estimate_tokens(&summary);
         let rows = self.list_messages_full(conv_id).unwrap_or_default();
         for r in &rows {
             if r.id <= summarized_until {
@@ -866,7 +725,7 @@ mod tests {
         };
         let mid = db
             .insert_message_with_attachments(
-                conv.id, "user", "你好", "", "[]", "[]", &[], &[], &[att],
+                conv.id, "user", "你好", "", "[]", "[]", &[], &[], &[], &[att],
             )
             .expect("插入消息失败");
         let msgs = db.list_messages(conv.id).expect("读取消息失败");

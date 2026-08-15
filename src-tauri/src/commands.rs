@@ -9,7 +9,6 @@ use crate::db::Db;
 use crate::llm::{CancelToken, run_agent};
 use crate::models::*;
 
-pub const DEEPSEEK_ANTHROPIC_BASE: &str = "https://api.deepseek.com/anthropic";
 const MAX_WEBPAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -121,44 +120,19 @@ fn save_attachments(
     Ok(out)
 }
 
-/// 取会话中最近一条用户消息里的第一张图片附件，转换为 data URL（供图生视频等使用）
-pub fn latest_user_image_data_url(state: &AppState, conv_id: i64) -> Option<String> {
-    let rows = state.db.list_messages_full(conv_id).ok()?;
-    for row in rows.iter().rev() {
-        if row.role != "user" {
-            continue;
-        }
-        let atts: Vec<crate::models::Attachment> =
-            serde_json::from_str(&row.attachments).unwrap_or_default();
-        for att in atts {
-            if att.kind != "image" {
-                continue;
-            }
-            let p = state.db.session_abs_path(conv_id, &att.path)?;
-            let bytes = std::fs::read(p).ok()?;
-            if bytes.is_empty() {
-                continue;
-            }
-            use base64::Engine;
-            let mime = if att.mime.starts_with("image/") {
-                att.mime.clone()
-            } else {
-                "image/jpeg".into()
-            };
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("data:{mime};base64,{b64}"));
-        }
-    }
-    None
-}
+
+
+
+
+
+
+
 
 pub struct AppState {
     pub db: Db,
     pub cancels: Mutex<HashMap<i64, Arc<CancelToken>>>,
     /// 越界访问待用户确认：conv_id -> 应答通道
     pub pending_perms: Mutex<HashMap<i64, oneshot::Sender<bool>>>,
-    /// 后台任务（如视频生成轮询）：key -> 取消令牌
-    pub bg_tasks: Mutex<HashMap<String, Arc<CancelToken>>>,
     pub client: Client,
 }
 
@@ -166,13 +140,16 @@ impl AppState {
     pub fn new(db: Db) -> Result<Self, Box<dyn std::error::Error>> {
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
+            // 连接保活：空闲连接保留 5 分钟——多轮工具循环 / 连续对话复用
+            // 同一服务商连接，省去每次 TLS+TCP 握手，降低首字节延迟
+            .pool_idle_timeout(std::time::Duration::from_secs(300))
+            .pool_max_idle_per_host(8)
             .user_agent("ChatDeepSeek/0.1")
             .build()?;
         Ok(Self {
             db,
             cancels: Mutex::new(HashMap::new()),
             pending_perms: Mutex::new(HashMap::new()),
-            bg_tasks: Mutex::new(HashMap::new()),
             client,
         })
     }
@@ -184,32 +161,14 @@ pub fn cancel_session_tasks(state: &AppState, conv_id: i64) {
     if let Some(t) = state.cancels.lock().unwrap().remove(&conv_id) {
         t.cancel();
     }
-    let prefix = format!("video-{conv_id}");
-    let mut tasks = state.bg_tasks.lock().unwrap();
-    let keys: Vec<String> = tasks
-        .keys()
-        .filter(|k| k.starts_with(&prefix))
-        .cloned()
-        .collect();
-    for k in keys {
-        if let Some(t) = tasks.remove(&k) {
-            t.cancel();
-        }
-    }
-    drop(tasks);
     // 丢弃等待用户确认的越界访问请求：会话已删除/编辑，确认已无意义。
     // 丢弃 oneshot sender 后等待方立即收到"确认已失效"，agent 任务得以尽快结束
     state.pending_perms.lock().unwrap().remove(&conv_id);
-    // 数据库中的未完成任务同步标记为已取消
-    let _ = state.db.cancel_jobs_for_session(conv_id);
 }
 
 /// 退出应用时取消所有进行中的任务，释放网络连接与系统资源
 pub fn cancel_all_tasks(state: &AppState) {
     for t in state.cancels.lock().unwrap().values() {
-        t.cancel();
-    }
-    for t in state.bg_tasks.lock().unwrap().values() {
         t.cancel();
     }
     // 清空所有待确认的越界访问请求（应用退出，确认无意义）
@@ -289,22 +248,10 @@ pub fn delete_conversation(state: State<Arc<AppState>>, id: i64) -> Result<(), S
     state.db.delete_conversation(id)
 }
 
-/// 列出会话的异步生成任务（视频等）；
-/// 若存在未完成且无存活轮询的任务（如应用重启后），自动恢复后台轮询
-#[tauri::command]
-pub fn list_jobs(
-    app: AppHandle,
-    state: State<Arc<AppState>>,
-    conversation_id: i64,
-) -> Result<Vec<Job>, String> {
-    crate::agent::generate::resume_jobs(&state, &app, conversation_id);
-    state.db.list_jobs(conversation_id)
-}
-
 #[tauri::command]
 pub fn clear_all_conversations(state: State<Arc<AppState>>) -> Result<(), String> {
-    // 先取消所有进行中的任务（agent + 视频轮询），否则它们会在目录删除后继续
-    // 轮询/写库，把已清空的会话目录与消息库"复活"成僵尸数据
+    // 先取消所有进行中的任务，否则它们会在目录删除后继续写库，
+    // 把已清空的会话目录与消息库"复活"成僵尸数据
     log::info!("[chat] 清空所有会话");
     cancel_all_tasks(&state);
     state.db.clear_all()
@@ -387,6 +334,7 @@ pub async fn send_message(
             "[]",
             &[],
             &[],
+            &[],
             &saved_atts,
         )
         .map_err(|e| e.to_string())?;
@@ -444,6 +392,26 @@ pub async fn edit_and_resend(
         save_attachments(&state, conversation_id, &uploads)?
     };
 
+    // 清理将被截断消息引用的图片文件：消息删除后这些图片成为孤儿文件，
+    // 累积在会话目录导致本地图片数量与当前轮次生成记录不一致
+    if let Ok(msgs) = state.db.list_messages(conversation_id) {
+        let dir = state.db.session_images_dir(conversation_id);
+        let mut removed = 0usize;
+        for m in msgs.iter().filter(|m| m.id >= message_id) {
+            for a in m.artifacts.iter().filter(|a| a.kind == "image") {
+                if std::fs::remove_file(dir.join(&a.name)).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            log::info!(
+                "[chat] 会话 {} 编辑重发：清理 {} 个孤儿图片文件",
+                conversation_id,
+                removed
+            );
+        }
+    }
     state.db.delete_messages_from(conversation_id, message_id)?;
     cancel_session_tasks(&state, conversation_id);
 
@@ -469,6 +437,7 @@ pub async fn edit_and_resend(
             "",
             "[]",
             "[]",
+            &[],
             &[],
             &[],
             &saved_atts,
@@ -518,89 +487,6 @@ pub fn stop_generation(state: State<Arc<AppState>>, conversation_id: i64) -> Res
     Ok(())
 }
 
-/// 测试 DeepSeek API 连接（Anthropic Messages 端点），返回成功或具体错误
-#[tauri::command]
-pub async fn test_deepseek_connection(
-    state: State<'_, Arc<AppState>>,
-    api_key: String,
-) -> Result<String, String> {
-    let key = api_key.trim();
-    if key.is_empty() {
-        return Err("未配置 DeepSeek API Key，请先在设置面板中填写".into());
-    }
-    let url = format!("{DEEPSEEK_ANTHROPIC_BASE}/v1/messages");
-    let body = serde_json::json!({
-        "model": "deepseek-v4-flash",
-        "max_tokens": 8,
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": false,
-    });
-    let resp = state
-        .client
-        .post(url)
-        .header("x-api-key", key)
-        .header("anthropic-version", "2023-06-01")
-        .timeout(std::time::Duration::from_secs(30))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("网络请求失败: {e}"))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        Ok("连接成功，API Key 有效，可正常使用 deepseek-v4-flash / deepseek-v4-pro".into())
-    } else {
-        Err(crate::llm::anthropic::api_error(status.as_u16(), &text))
-    }
-}
-
-/// 获取硅基流动账户当前可用的视频生成模型列表（用于设置面板下拉选择与自动回退）
-#[tauri::command]
-pub async fn list_sf_video_models(
-    state: State<'_, Arc<AppState>>,
-    api_key: String,
-    base_url: String,
-) -> Result<Vec<String>, String> {
-    let key = api_key.trim();
-    if key.is_empty() {
-        return Err("未配置硅基流动 API Key，请先填写 API Key".into());
-    }
-    let base = base_url.trim().trim_end_matches('/');
-    let url = format!("{base}/models?type=video");
-    let resp = state
-        .client
-        .get(url)
-        .bearer_auth(key)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("获取视频模型列表失败: {e}"))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "获取视频模型列表失败 ({status}): {}",
-            text.chars().take(200).collect::<String>()
-        ));
-    }
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("模型列表解析失败: {e}"))?;
-    let models: Vec<String> = v["data"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if models.is_empty() {
-        return Err(
-            "账户下暂无可用视频模型（视频模型需先在 cloud.siliconflow.cn 模型广场中开通）".into(),
-        );
-    }
-    Ok(models)
-}
-
 /// 测试服务商下某个模型是否可用（按模型类型分别测试）
 #[tauri::command]
 pub async fn test_model(
@@ -613,7 +499,6 @@ pub async fn test_model(
         return Err("未填写该服务商的 API Key".into());
     }
     let base = provider.api_base.trim_end_matches('/');
-    let anthropic = provider.protocol == crate::models::PROTOCOL_ANTHROPIC;
 
     match model.model_type.as_str() {
         crate::models::MODEL_TYPE_TEXT | crate::models::MODEL_TYPE_VISION => {
@@ -623,20 +508,10 @@ pub async fn test_model(
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": false,
             });
-            let url = if anthropic {
-                format!("{base}/v1/messages")
-            } else {
-                format!("{base}/chat/completions")
-            };
-            let mut req = state.client.post(url);
-            if anthropic {
-                req = req
-                    .header("x-api-key", key)
-                    .header("anthropic-version", "2023-06-01");
-            } else {
-                req = req.bearer_auth(key);
-            }
-            let resp = req
+            let resp = state
+                .client
+                .post(format!("{base}/chat/completions"))
+                .bearer_auth(key)
                 .timeout(std::time::Duration::from_secs(30))
                 .json(&body)
                 .send()
@@ -679,25 +554,6 @@ pub async fn test_model(
                     model.name,
                     text.chars().take(200).collect::<String>()
                 ))
-            }
-        }
-        crate::models::MODEL_TYPE_VIDEO => {
-            // 视频生成不实际提交任务，仅验证认证与接口可达
-            let resp = state
-                .client
-                .get(format!("{base}/models"))
-                .bearer_auth(key)
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
-                .await
-                .map_err(|e| format!("网络请求失败: {e}"))?;
-            let status = resp.status();
-            if status == 401 || status == 403 {
-                Err(format!("「{}」认证失败 ({status})：API Key 无效或未授权", model.name))
-            } else if status.is_success() || status == 404 {
-                Ok(format!("「{}」认证通过；视频生成将在实际生成时验证", model.name))
-            } else {
-                Err(format!("「{}」测试失败 ({status})", model.name))
             }
         }
         _ => Err("未知模型类型".into()),
@@ -762,6 +618,20 @@ fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
         || o[0] >= 224
 }
 
+/// 拼接错误链：reqwest 对 body 读取失败统一包装为 "error decoding response body"，
+/// 真实原因（超时/连接中断/TLS 等）在 source 链中，拼出来便于定位问题
+fn err_source_chain(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut out = String::new();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(" -> ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
+}
+
 /// 抓取网页，返回可安全渲染的页面 HTML（保留结构/样式/图片，剔除脚本等危险内容），供右侧预览面板展示
 #[tauri::command]
 pub async fn fetch_webpage(
@@ -787,7 +657,10 @@ pub async fn fetch_webpage(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             )
             .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .timeout(std::time::Duration::from_secs(20))
+            // 显式请求未压缩内容：部分服务器/代理返回损坏的 gzip 流会导致解码失败
+            .header("accept-encoding", "identity")
+            // 总超时（连接+下载）放宽到 60s：大页面/慢网络不再因 20s 上限误报 body 解码错误
+            .timeout(std::time::Duration::from_secs(60))
             .send()
             .await
             .map_err(|e| format!("网页请求失败: {e}"))?;
@@ -831,7 +704,7 @@ pub async fn fetch_webpage(
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| format!("读取网页内容失败: {e}"))?;
+        .map_err(|e| format!("读取网页内容失败: {}{}", e, err_source_chain(&e)))?;
     if bytes.len() > MAX_WEBPAGE_BYTES {
         return Err(format!("网页过大（超过 {}MB），无法预览", MAX_WEBPAGE_BYTES / 1024 / 1024));
     }
