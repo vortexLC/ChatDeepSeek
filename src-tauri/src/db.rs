@@ -410,6 +410,23 @@ impl Db {
         self.session_dir(id).join("uploads")
     }
 
+    /// 全局沙箱工具目录授权缓存标记（跨会话共享，位于 sessions 根目录）：
+    /// 内容为「PATH 指纹 + 沙箱模式」两行。AppContainer 工具目录的 ACL
+    /// 授权是持久的且耗时（首次可达数十秒），用此标记避免重复授权；
+    /// PATH 变化（用户新装工具）时指纹不匹配自动重新授权
+    pub fn sandbox_grant_marker(&self) -> PathBuf {
+        self.sessions_dir.join(".sandbox_grant_marker")
+    }
+
+    /// 会话临时目录：沙箱 bash 的 TEMP/TMP 重定向目标与各类构建缓存
+    /// （pip/npm/cargo/go 的默认缓存位置在用户目录下，AppContainer 无法写入）。
+    /// 位于会话目录内，随会话删除一并清理
+    pub fn session_tmp_dir(&self, id: i64) -> PathBuf {
+        let d = self.session_dir(id).join("tmp");
+        let _ = fs::create_dir_all(&d);
+        d
+    }
+
     /// 校验相对路径并返回会话目录内的绝对路径（组件级规范化，禁止 `..` 逃逸；绝对路径返回 None）
     pub fn session_abs_path(&self, id: i64, rel: &str) -> Option<PathBuf> {
         let dir = self.session_dir(id);

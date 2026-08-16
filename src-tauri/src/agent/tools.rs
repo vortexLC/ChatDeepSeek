@@ -160,13 +160,13 @@ async fn resolve_path(
     for c in rel_path.components() {
         match c {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if stack.is_empty() {
-                    stack.push(c);
-                } else {
+            Component::ParentDir => match stack.last() {
+                // 栈顶已是 ..：连续向上（如 ../..），继续累积而非相互抵消
+                Some(Component::ParentDir) | None => stack.push(c),
+                Some(_) => {
                     stack.pop();
                 }
-            }
+            },
             other => stack.push(other),
         }
     }
@@ -281,7 +281,7 @@ async fn delete_file(app: &AppHandle, state: &AppState, conv_id: i64, arguments:
 
 async fn list_files(app: &AppHandle, state: &AppState, conv_id: i64, arguments: &str) -> String {
     let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
-    let dir = args["dir"].as_str().unwrap_or("files").trim();
+    let dir = args["dir"].as_str().unwrap_or(".").trim();
     let p = if dir.is_empty() || dir == "." {
         state.db.session_files_dir(conv_id)
     } else {
@@ -293,17 +293,26 @@ async fn list_files(app: &AppHandle, state: &AppState, conv_id: i64, arguments: 
     if !p.is_dir() {
         return format!("目录不存在: {dir}");
     }
-    let base = state.db.session_files_dir(conv_id);
     let mut out = String::from("【会话文件目录】\n");
-    let _ = walk_files(&p, &base, 0, &mut out, 2);
+    let mut counter = 0usize;
+    let _ = walk_files(&p, 0, &mut out, 5, &mut counter);
     if out == "【会话文件目录】\n" {
         out.push_str("（空目录）");
     }
     out
 }
 
-fn walk_files(dir: &Path, base: &Path, depth: usize, out: &mut String, max_depth: usize) -> std::io::Result<()> {
-    if depth > max_depth {
+/// 遍历目录树输出结构。max_depth 取 5：编程项目（src/components/xxx 等）
+/// 深度普遍超过 2 层；条目上限防止超大目录撑爆上下文
+fn walk_files(
+    dir: &Path,
+    depth: usize,
+    out: &mut String,
+    max_depth: usize,
+    counter: &mut usize,
+) -> std::io::Result<()> {
+    const MAX_ENTRIES: usize = 400;
+    if depth > max_depth || *counter >= MAX_ENTRIES {
         return Ok(());
     }
     let mut entries: Vec<_> = std::fs::read_dir(dir)?
@@ -311,13 +320,19 @@ fn walk_files(dir: &Path, base: &Path, depth: usize, out: &mut String, max_depth
         .collect();
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
+        if *counter >= MAX_ENTRIES {
+            out.push_str("...(条目过多已截断)\n");
+            return Ok(());
+        }
         let path = e.path();
         if path.is_dir() {
             out.push_str(&format!("{}{}/\n", "  ".repeat(depth), e.file_name().to_string_lossy()));
-            walk_files(&path, base, depth + 1, out, max_depth)?;
+            *counter += 1;
+            walk_files(&path, depth + 1, out, max_depth, counter)?;
         } else {
             let size = e.metadata().map(|m| m.len()).unwrap_or(0);
             out.push_str(&format!("{}{}  ({} B)\n", "  ".repeat(depth), e.file_name().to_string_lossy(), size));
+            *counter += 1;
         }
     }
     Ok(())
@@ -330,10 +345,17 @@ fn glob_files(state: &AppState, conv_id: i64, arguments: &str) -> String {
         return "glob 缺少 pattern 参数".into();
     }
     let base = state.db.session_files_dir(conv_id);
+    // 分隔符统一为 /：模型通常输出标准 glob（**/*.rs），
+    // 而 Windows 相对路径分隔符为 \，不统一则永远匹配不上
+    let norm_pattern = pattern.replace('\\', "/");
     let mut matches = Vec::new();
     for entry in walkdir_collect(&base) {
-        let rel = entry.strip_prefix(&base).map(|r| r.display().to_string()).unwrap_or_default();
-        if glob_match(pattern, &rel) {
+        let rel = entry
+            .strip_prefix(&base)
+            .map(|r| r.display().to_string())
+            .unwrap_or_default()
+            .replace('\\', "/");
+        if glob_match(&norm_pattern, &rel) {
             matches.push(rel);
         }
     }
@@ -401,7 +423,7 @@ fn grep_files(state: &AppState, conv_id: i64, arguments: &str) -> String {
                         .strip_prefix(&base)
                         .map(|r| r.display().to_string())
                         .unwrap_or_default();
-                    out.push_str(&format!("{}:{i}: {}\n", rel, line.chars().take(160).collect::<String>()));
+                    out.push_str(&format!("{}:{}: {}\n", rel, i + 1, line.chars().take(160).collect::<String>()));
                     count += 1;
                     if count >= 100 {
                         out.push_str("...(结果过多已截断)");
@@ -467,37 +489,121 @@ async fn run_bash(
     }
     let cwd = state.db.session_files_dir(conv_id);
     let _ = std::fs::create_dir_all(&cwd);
+    let tmp = state.db.session_tmp_dir(conv_id);
+    let uploads = state.db.session_uploads_dir(conv_id);
 
-    // 初始化 AppContainer 沙箱（失败则拒绝执行，安全第一）
-    let sandbox = crate::agent::sandbox::ContainerSandbox::for_session(conv_id)?;
-    if let Err(e) = sandbox.grant_access(&cwd) {
-        return Err(format!("沙箱初始化失败：{e}（已拒绝执行命令）"));
+    // ---------- 沙箱模式决策 ----------
+    // 首选 AppContainer（OS 级读写双向隔离）；当工具目录无法授权
+    // （目录 Owner=Administrators，非提权进程无 WRITE_DAC，错误 5）或
+    // 网络 capability 派生失败时，降级为低完整性模式（工具链可用、可联网、
+    // 仍禁止写入工作区外，但可读取工作区外文件）。决策结果按 PATH 指纹
+    // 全局缓存（授权耗时可达数十秒），PATH 变化时自动重评估
+    let path_fp = std::env::var("PATH").unwrap_or_default();
+    let marker = state.db.sandbox_grant_marker();
+    let marker_content = std::fs::read_to_string(&marker).unwrap_or_default();
+    let mut lines = marker_content.lines();
+    // 首行为格式版本：不匹配（含旧格式缓存）时强制重评决策——
+    // 修复 capability 检测 / Low 打标缺陷前的缓存决策不可信
+    let cached_ver = lines.next().unwrap_or("");
+    let cached_fp = lines.next().unwrap_or("");
+    let cached_mode = lines.next().unwrap_or("");
+
+    let sandbox = crate::agent::sandbox::ContainerSandbox::shared()?;
+    let use_container = if cached_ver == "v2" && cached_fp == path_fp && !cached_mode.is_empty() {
+        // 指纹命中：沿用缓存决策
+        cached_mode == "container"
+    } else {
+        // 首次、PATH 变化或旧格式：实际授权并记录决策
+        let tool_failed = sandbox.grant_dev_tool_dirs();
+        let container_ok =
+            tool_failed.is_empty() && sandbox.has_network_capability();
+        if !container_ok {
+            if !tool_failed.is_empty() {
+                log::warn!(
+                    "[sandbox] {} 个工具目录无法授权（需要目录写 ACL 权限），本机降级为低完整性沙箱：{:?}",
+                    tool_failed.len(),
+                    tool_failed
+                );
+            } else {
+                log::warn!("[sandbox] 网络 capability 派生失败，本机降级为低完整性沙箱");
+            }
+        }
+        let mode = if container_ok { "container" } else { "low-integrity" };
+        let _ = std::fs::write(&marker, format!("v2\n{path_fp}\n{mode}"));
+        container_ok
+    };
+
+    // 会话目录就绪：容器模式授权给容器 SID（低完整性模式打 Low 标签）。
+    // 上传目录给读权限（bash 可读附件）。会话目录授权幂等且快速
+    // （仅本应用所有的目录），无需额外缓存
+    if use_container {
+        if let Err(e) = sandbox.grant_access(&cwd) {
+            return Err(format!("沙箱初始化失败：{e}（已拒绝执行命令）"));
+        }
+        if let Err(e) = sandbox.grant_access(&tmp) {
+            return Err(format!("沙箱临时目录授权失败：{e}（已拒绝执行命令）"));
+        }
+        if uploads.is_dir() {
+            if let Err(e) = sandbox.grant_read_execute(&uploads) {
+                log::warn!("[sandbox] 上传目录授权失败（不影响执行）：{e}");
+            }
+        }
+    } else {
+        if let Err(e) = crate::agent::sandbox::label_dir_tree_low(&cwd) {
+            return Err(format!("低完整性沙箱初始化失败：{e}（已拒绝执行命令）"));
+        }
+        if let Err(e) = crate::agent::sandbox::label_dir_tree_low(&tmp) {
+            return Err(format!("临时目录打标失败：{e}（已拒绝执行命令）"));
+        }
     }
 
-    // 命令在阻塞线程中运行（std Command + AppContainer 属性），外层处理取消与超时
+    // 环境重定向：TEMP/TMP 与各包管理器缓存都指向会话 tmp 目录
+    // （默认位置在用户目录下，AppContainer 无权写入，pip/npm/cargo/go 会直接失败）
+    let tmp_s = tmp.display().to_string();
+    let env_overrides: Vec<(String, String)> = vec![
+        ("TEMP".into(), tmp_s.clone()),
+        ("TMP".into(), tmp_s.clone()),
+        ("PIP_CACHE_DIR".into(), tmp.join("pip-cache").display().to_string()),
+        ("npm_config_cache".into(), tmp.join("npm-cache").display().to_string()),
+        // CARGO_HOME 重定向到会话内（registry/缓存写入）；rustup 工具链读取
+        // 已由 grant_dev_tool_dirs 授权原位置，不受影响
+        ("CARGO_HOME".into(), tmp.join("cargo").display().to_string()),
+        ("GOPATH".into(), tmp.join("gopath").display().to_string()),
+        ("GOCACHE".into(), tmp.join("gocache").display().to_string()),
+        ("GOMODCACHE".into(), tmp.join("gopath").join("pkg").join("mod").display().to_string()),
+    ];
+
+    // 命令在阻塞线程中运行（std 进程创建 + 安全属性），外层处理取消与超时。
+    // 外层超时略大于 sandbox 内部硬超时（内部负责终止子进程并回收输出）
     let cmd_str = command.to_string();
     let cwd2 = cwd.clone();
     let handle = tokio::task::spawn_blocking(move || {
-        let sb = sandbox;
-        match sb.run(&cwd2, &cmd_str) {
+        let result = if use_container {
+            sandbox.run(&cwd2, &cmd_str, &env_overrides)
+        } else {
+            crate::agent::sandbox::run_low_integrity(&cwd2, &cmd_str, &env_overrides)
+        };
+        match result {
             Ok((out, err, code)) => Ok(crate::agent::sandbox::format_output(&out, &err, code)),
             Err(e) => Err(e),
         }
     });
 
+    let outer_timeout =
+        std::time::Duration::from_secs(crate::agent::sandbox::BASH_TIMEOUT_SECS as u64 + 15);
     let result = {
         let cancel_fut = async {
             token.wait().await;
-            // 无法中断阻塞线程中的子进程，超时（60s）兜底
+            // 无法中断阻塞线程中的子进程，超时兜底
         };
-        let run_fut = tokio::time::timeout(std::time::Duration::from_secs(60), handle);
+        let run_fut = tokio::time::timeout(outer_timeout, handle);
         tokio::pin!(run_fut);
         tokio::select! {
             _ = cancel_fut => Err("已停止生成".into()),
             res = &mut run_fut => match res {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err("命令执行超时（60 秒）".into()),
+                Err(_) => Err(format!("命令执行超时（{} 秒）", crate::agent::sandbox::BASH_TIMEOUT_SECS)),
             },
         }
     };
@@ -575,7 +681,7 @@ fn file_tools() -> Vec<serde_json::Value> {
         tool_def(
             TOOL_GLOB,
             "按 glob 模式匹配会话 files 目录中的文件路径（支持 * 与 ?）。",
-            json!({"pattern": {"type": "string", "description": "如 **\\*.rs 或 src/*.ts"}}),
+            json!({"pattern": {"type": "string", "description": "glob 模式，如 **/*.rs 或 src/*.ts（/ 与 \\ 均可）"}}),
             vec!["pattern"],
         ),
         tool_def(
@@ -599,7 +705,7 @@ fn generate_image_tool() -> serde_json::Value {
         "根据文字描述生成一张图片（AI 绘画）。当用户要求生成、绘制、设计图片或图像时，必须调用此工具——系统会调用专门的绘图模型完成生成，你无需也无法自己'画'出来，直接调用即可。生成结果自动保存到会话 images 目录。",
         json!({
             "prompt": {"type": "string", "description": "图片描述，越详细越好（主体、场景、风格、光线、构图等）"},
-            "image_size": {"type": "string", "enum": ["1024x1024", "960x1280", "768x1024", "720x1440", "720x1280"], "description": "图片尺寸，默认 1024x1024"},
+            "image_size": {"type": "string", "enum": ["1024x1024", "960x1280", "768x1024", "720x1440", "720x1280", "1328x1328", "1664x928", "928x1664", "1472x1140", "1140x1472", "1584x1056", "1056x1584"], "description": "图片尺寸（宽x高），默认 1024x1024；不同模型支持的尺寸不同，不支持的值会自动调整为最接近的合法尺寸"},
             "negative_prompt": {"type": "string", "description": "负面提示词（不希望出现的内容）"}
         }),
         vec!["prompt"],
