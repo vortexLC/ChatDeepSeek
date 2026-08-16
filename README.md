@@ -1,5 +1,7 @@
 # ChatDeepSeek
 
+[中文](README.md) | [English](README_EN.md) | [License](LICENSE)
+
 一款使用 **Tauri v2 + Rust + SQLite + React** 构建的桌面端 AI 对话应用，以「精简、高效、高质量视觉体验」为设计目标，支持**OpenAI 兼容接口**（自定义主体模型 / 图片生成模型）、**联网搜索**（Tavily + AnySearch）、**图片生成**与**隔离沙箱编程工具**。
 
 ## 功能特性
